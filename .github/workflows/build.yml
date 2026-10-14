@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --name PDFStudio pdf_studio.py
+        run: pyinstaller --noconfirm --onefile --windowed --name PDFStudio --icon pdfstudio.ico pdf_studio.py
       - name: Zip
         shell: pwsh
         run: Compress-Archive -Path dist/PDFStudio.exe -DestinationPath PDFStudio-windows.zip

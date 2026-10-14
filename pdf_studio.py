@@ -15,8 +15,14 @@ PDF Studio - PDF reader/editor for Windows
 Requirements:   pip install pymupdf PyQt6
 Run:            python pdf_studio.py [file.pdf ...]
 Register menu:  python pdf_studio.py --install      (remove: --uninstall)
+                adds Explorer entries, the PDF Studio icon for .pdf files, a Start-menu shortcut,
+                and lists the app under Settings > Default apps
+Icon file:      python pdf_studio.py --export-icon pdfstudio.ico   (used for the .exe build)
 """
 import sys, os, re, time, glob, tempfile, math, bisect, string, html as _html, shutil
+
+SERVER_NAME = "PDFStudio_single_instance_" + re.sub(r"\W", "_", os.environ.get("USERNAME", os.environ.get("USER", "u")))
+APP_USER_MODEL_ID = "PDFStudio.PDFStudio.1"     # Windows taskbar identity (own icon + own button group)
 
 
 # ============================================================================
@@ -189,6 +195,48 @@ if len(sys.argv) > 1 and sys.argv[1] == "--merge":
         sys.exit(0)
 
 
+def _fast_forward(paths):
+    """If PDF Studio is already running, give it the files and return True.
+    Standard library only, so a second launch (double-click on another PDF) costs a few milliseconds:
+    no Qt and no PyMuPDF are imported. The running window opens a new tab and comes to the front."""
+    data = "\n".join(paths).encode("utf-8")
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            try:
+                ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)   # ASFW_ANY: the running window may take focus
+            except Exception:
+                pass
+            pipe = "\\\\.\\pipe\\" + SERVER_NAME                          # where Qt's QLocalServer listens
+            for _ in range(20):
+                try:
+                    with open(pipe, "wb", buffering=0) as f:
+                        f.write(data)
+                    return True
+                except FileNotFoundError:
+                    return False                            # nobody is listening: start normally
+                except OSError:
+                    time.sleep(0.05)                        # pipe busy: another launch is being handed over
+            return False
+        import socket
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            s.connect(os.path.join(tempfile.gettempdir(), SERVER_NAME))
+            s.sendall(data)
+            return True
+        finally:
+            s.close()
+    except Exception:
+        return False                                        # anything unexpected: fall back to the normal path
+
+
+if not (len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall", "--export-icon")):
+    if _fast_forward([_open_after] if _open_after else
+                     [os.path.abspath(a) for a in sys.argv[1:] if not a.startswith("--")]):
+        sys.exit(0)
+
+
 # ============================================================================
 #  EXPLORER CONTEXT MENU (registry, current user only - no admin needed)
 # ============================================================================
@@ -230,26 +278,68 @@ def _reg_delete_tree(path):
         pass
 
 
+def _notify_assoc_changed():
+    """Tell Explorer that file associations/icons changed so it redraws them right away."""
+    try:
+        import ctypes
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)      # SHCNE_ASSOCCHANGED
+    except Exception:
+        pass
+
+
+def _start_menu_link():
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs",
+                        "PDF Studio.lnk")
+
+
+def _create_start_menu_shortcut(icon_path):
+    """Start-menu entry with the PDF Studio icon (uses PowerShell's WScript.Shell; silent on failure)."""
+    import subprocess
+    if getattr(sys, "frozen", False):
+        target, args = sys.executable, ""
+    else:
+        py = sys.executable
+        if py.lower().endswith("python.exe"):
+            py = py[:-10] + "pythonw.exe"
+        target, args = py, f'"{os.path.abspath(__file__)}"'
+    q = lambda s: s.replace("'", "''")
+    ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(_start_menu_link())}');"
+          f"$s.TargetPath='{q(target)}';$s.Arguments='{q(args)}';$s.IconLocation='{q(icon_path)},0';"
+          f"$s.Description='PDF Studio';$s.WorkingDirectory='{q(os.path.dirname(target))}';$s.Save()")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+                       creationflags=0x08000000, timeout=30)
+    except Exception:
+        pass
+
+
 def install_context_menu():
     cmd = _base_cmd()
+    icon = _icon_ref()                                      # exe resource when frozen, else a generated .ico
     # "Combine" in the right-click menu of PDFs and images (works for mixed selections)
     for ext in ALL_EXT:
         base = f"{_REG_ROOT}\\{ext}\\shell\\PDFStudioCombine"
         _reg_set(base, "MUIVerb", "Combine (PDF Studio)")
+        _reg_set(base, "Icon", icon)
         _reg_set(base, "MultiSelectModel", "Player")
         _reg_set(base + "\\command", "", f'{cmd} --merge "%1"')
     # "Open with PDF Studio" for single PDFs
     base = f"{_REG_ROOT}\\.pdf\\shell\\PDFStudioEdit"
     _reg_set(base, "MUIVerb", "Open with PDF Studio")
+    _reg_set(base, "Icon", icon)
     _reg_set(base + "\\command", "", f'{cmd} "%1"')
     # Register as an installed app so it shows up in Settings > Default apps
     _reg_set(f"Software\\Classes\\{_APP_ID}", "", "PDF Document (PDF Studio)")
+    _reg_set(f"Software\\Classes\\{_APP_ID}\\DefaultIcon", "", icon)           # icon of .pdf files in Explorer
     _reg_set(f"Software\\Classes\\{_APP_ID}\\shell\\open\\command", "", f'{cmd} "%1"')
     _reg_set("Software\\PDFStudio\\Capabilities", "ApplicationName", "PDF Studio")
     _reg_set("Software\\PDFStudio\\Capabilities", "ApplicationDescription", "PDF reader and editor")
+    _reg_set("Software\\PDFStudio\\Capabilities", "ApplicationIcon", icon)
     _reg_set("Software\\PDFStudio\\Capabilities\\FileAssociations", ".pdf", _APP_ID)
     _reg_set("Software\\RegisteredApplications", "PDF Studio", "Software\\PDFStudio\\Capabilities")
     _reg_set(f"Software\\Classes\\.pdf\\OpenWithProgids", _APP_ID, "")
+    _create_start_menu_shortcut(icon.rsplit(",", 1)[0].strip('"'))
+    _notify_assoc_changed()
 
 
 def uninstall_context_menu():
@@ -265,19 +355,11 @@ def uninstall_context_menu():
         winreg.DeleteValue(k, "PDF Studio")
     except OSError:
         pass
-
-
-if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
-    (install_context_menu if sys.argv[1] == "--install" else uninstall_context_menu)()
-    if sys.argv[1] == "--install":
-        _msg("Installed.\nSettings > Default apps will open now: search 'PDF Studio' (or .pdf) and set it as default.", 0x40)
-        try:
-            os.startfile("ms-settings:defaultapps")
-        except OSError:
-            pass
-    else:
-        _msg("Removed.", 0x40)
-    sys.exit(0)
+    try:
+        os.remove(_start_menu_link())
+    except OSError:
+        pass
+    _notify_assoc_changed()
 
 
 # ============================================================================
@@ -285,7 +367,7 @@ if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
 # ============================================================================
 import pymupdf as fitz
 from PyQt6.QtCore import (Qt, QSize, QSizeF, QPoint, QPointF, QRectF, QMarginsF, QTimer, QEvent,
-                          QMimeData, QObject, QUrl, pyqtSignal)
+                          QMimeData, QObject, QSettings, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDrag, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
                          QPalette, QPixmap, QPainter, QPen, QPainterPath, QPageLayout, QPageSize, QRadialGradient,
                          QTransform)
@@ -316,7 +398,6 @@ def page_size_for(paper, custom_mm=(210.0, 297.0)):
         return QPageSize(QSizeF(float(custom_mm[0]), float(custom_mm[1])), QPageSize.Unit.Millimeter,
                          "Custom", QPageSize.SizeMatchPolicy.ExactMatch)
     return QPageSize(PAPERS[paper])
-SERVER_NAME = "PDFStudio_single_instance_" + re.sub(r"\W", "_", os.environ.get("USERNAME", os.environ.get("USER", "u")))
 
 
 def pix_to_qimage(pix):
@@ -324,14 +405,15 @@ def pix_to_qimage(pix):
     return QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
 
 
-def app_icon():
-    """PDF Studio mark: a red rounded square with a white folded page (drawn in code)."""
+def icon_pixmap(n=256):
+    """PDF Studio mark at n x n pixels: a red rounded square with a white folded page (drawn in code)."""
     S = 256
-    pix = QPixmap(S, S)
+    pix = QPixmap(n, n)
     pix.fill(Qt.GlobalColor.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    p.scale(n / S, n / S)
     p.setPen(Qt.PenStyle.NoPen)
     r = QRectF(24, 20, S - 48, S - 48)
     rad = 46
@@ -369,7 +451,50 @@ def app_icon():
     for i, wd in enumerate((56, 56, 36)):
         p.drawRoundedRect(QRectF(pg.left() + 18, pg.top() + 52 + i * 18, wd, 8), 4, 4)
     p.end()
-    return QIcon(pix)
+    return pix
+
+
+_ICON = None
+
+
+def app_icon():
+    """The application icon with every size Windows asks for (title bar, taskbar, Alt-Tab, dialogs)."""
+    global _ICON
+    if _ICON is None:
+        _ICON = QIcon()
+        for n in (16, 20, 24, 32, 40, 48, 64, 96, 128, 256):
+            _ICON.addPixmap(icon_pixmap(n))
+    return _ICON
+
+
+def save_ico(path, sizes=(16, 24, 32, 48, 64, 128, 256)):
+    """Write a multi-size .ico (PNG-compressed entries) for the exe, Explorer, shortcuts and file types."""
+    import struct
+    from PyQt6.QtCore import QBuffer, QIODevice
+    imgs = []
+    for n in sizes:
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        icon_pixmap(n).save(buf, "PNG")
+        imgs.append((n, bytes(buf.data())))
+    head = struct.pack("<HHH", 0, 1, len(imgs))
+    entries, blobs, off = b"", b"", 6 + 16 * len(imgs)
+    for n, data in imgs:
+        entries += struct.pack("<BBBBHHII", n % 256, n % 256, 0, 0, 1, 32, len(data), off + len(blobs))
+        blobs += data
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(head + entries + blobs)
+
+
+def _icon_ref():
+    """Icon location string for the registry: the exe itself when frozen, otherwise a generated .ico file."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}",0'
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = os.path.join(base, "PDFStudio", "pdfstudio.ico")
+    save_ico(path)
+    return f'"{path}",0'
 
 
 # ============================================================================
@@ -3319,7 +3444,14 @@ class Main(DarkTitleBarMixin, QMainWindow):
         self.setWindowIcon(app_icon())
         self.server = None
         self._print_dialog_preferences = None    # session-only; cleared when this app process exits
+        self._settings = QSettings("PDFStudio", "PDFStudio")     # remembers window size/position between runs
         self.resize(1200, 850)
+        g = self._settings.value("window/geometry")
+        if g is not None:
+            try:
+                self.restoreGeometry(g)
+            except Exception:
+                pass
 
         self.tabs = Tabs()
         self.tabs.tabCloseRequested.connect(self.close_tab)
@@ -3438,6 +3570,18 @@ class Main(DarkTitleBarMixin, QMainWindow):
             self.tabs.setCurrentIndex((self.tabs.currentIndex() + d) % n)
 
     # ---------- single instance ----------
+    def bring_to_front(self):
+        """Restore (if minimized) and focus this window, as Acrobat does when you open another PDF."""
+        self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+            except Exception:
+                pass
+
     def attach_server(self, server):
         self.server = server
         server.newConnection.connect(self._on_connection)
@@ -3451,10 +3595,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
             buf.extend(bytes(sock.readAll()))
             paths = [l for l in buf.decode("utf-8", "ignore").splitlines() if l.strip()]
             self.open_paths(paths)
-            if self.isMinimized():
-                self.showNormal()
-            self.raise_()
-            self.activateWindow()
+            self.bring_to_front()
             sock.deleteLater()
         sock.disconnected.connect(done)
 
@@ -3565,6 +3706,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
         for i in range(self.tabs.count()):
             if not self.maybe_save(self.tabs.widget(i)):
                 return e.ignore()
+        self._settings.setValue("window/geometry", self.saveGeometry())
         e.accept()
 
     # ---------- explorer menu ----------
@@ -3614,11 +3756,36 @@ def acquire_instance(paths):
     return "alone", None
 
 
+def _set_app_user_model_id():
+    """Windows picks the taskbar icon and groups taskbar buttons by AppUserModelID. Without our own id a
+    script run shows the Python icon in the taskbar; with it, PDF Studio gets its own icon and button."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
+    _set_app_user_model_id()
     app = QApplication(sys.argv)
-    apply_theme(app)
+    app.setApplicationName("PDF Studio")
     app.setWindowIcon(app_icon())
-    _cleanup_old_page_exports()
+    if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
+        (install_context_menu if sys.argv[1] == "--install" else uninstall_context_menu)()
+        if sys.argv[1] == "--install":
+            _msg("Installed.\nSettings > Default apps will open now: search 'PDF Studio' (or .pdf) and set it as default.", 0x40)
+            try:
+                os.startfile("ms-settings:defaultapps")
+            except OSError:
+                pass
+        else:
+            _msg("Removed.", 0x40)
+        sys.exit(0)
+    if len(sys.argv) > 2 and sys.argv[1] == "--export-icon":
+        save_ico(sys.argv[2])
+        sys.exit(0)
+    apply_theme(app)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     paths = [_open_after] if _open_after else [os.path.abspath(a) for a in args]
     mode, server = acquire_instance(paths)
@@ -3629,4 +3796,5 @@ if __name__ == "__main__":
         w.attach_server(server)
     w.show()
     w.open_paths(paths)
+    QTimer.singleShot(4000, _cleanup_old_page_exports)      # housekeeping after the window is already up
     sys.exit(app.exec())
