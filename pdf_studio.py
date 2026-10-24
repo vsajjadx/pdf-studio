@@ -1588,8 +1588,16 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             return g
 
         row_printer = QHBoxLayout()
+        self.cb_printer.setMaximumWidth(220)                    # compact printer drop-down
+        self.cb_printer.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_printer.setMinimumContentsLength(14)
         row_printer.addWidget(self.cb_printer, 1)
+        row_printer.addSpacing(8)
+        row_printer.addWidget(QLabel("Paper size:"))            # paper size sits between printer and Settings
+        row_printer.addWidget(self.cb_paper)
+        row_printer.addSpacing(8)
         row_printer.addWidget(self.btn_printer_props)
+        row_printer.addStretch(1)
         w_printer = QWidget()
         w_printer.setLayout(row_printer)
 
@@ -1609,14 +1617,12 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
         # Page Sizing & Handling: paper, size (scale) radios, pages per sheet, both-sides ticks
         f2 = QFormLayout()
-        f2.addRow("Paper size:", self.cb_paper)
-        f2.addRow(self.lbl_custom, self.w_custom)
+        f2.addRow(self.lbl_custom, self.w_custom)               # only shown for a custom paper size
         row_per = QHBoxLayout()
         row_per.addWidget(self.cb_persheet, 1)
         row_per.addWidget(self.sp_persheet)
         w_per = QWidget()
         w_per.setLayout(row_per)
-        f2.addRow("Pages per sheet:", w_per)
         v2 = QVBoxLayout()
         v2.setSpacing(8)
         v2.addLayout(f2)
@@ -1624,6 +1630,9 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         v2.addWidget(self.cb_scale.box)
         v2.addWidget(self.ck_duplex)
         v2.addWidget(self.w_flip)
+        f_per = QFormLayout()
+        f_per.addRow("Pages per sheet:", w_per)
+        v2.addLayout(f_per)
         v_orient = QVBoxLayout()
         v_orient.addWidget(self.cb_orient.box)
         f3 = QVBoxLayout()
