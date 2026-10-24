@@ -1192,13 +1192,48 @@ def _is_landscape(orient, rect):
     return orient == "l" or (orient == "auto" and rect.width > rect.height)
 
 
-def _draw_page_banded(painter, page, dest, r, rotation=0, grayscale=False):
+def _content_box(source, pr):
+    """Smallest rectangle (page points) holding everything visible on the page, found from a small probe
+    render and padded so nothing can be cut off. None means the page is completely blank."""
+    k = min(100 / 72.0, math.sqrt(4_000_000 / max(1.0, pr.width * pr.height)))
+    pix = source.get_pixmap(matrix=fitz.Matrix(k, k), alpha=False)
+    w, h, n, stride, s = pix.width, pix.height, pix.n, pix.stride, pix.samples
+    top = bottom = None
+    left, right = w * n, 0                                    # in bytes
+    for y in range(h):
+        row = s[y * stride:y * stride + w * n]
+        t = row.lstrip(b"\xff")
+        if not t:
+            continue
+        if top is None:
+            top = y
+        bottom = y
+        left = min(left, len(row) - len(t))
+        right = max(right, len(row.rstrip(b"\xff")))
+    if top is None:
+        return None
+    pad = 4
+    x0, x1 = max(0, left // n - pad), min(w, -(-right // n) + pad)
+    y0, y1 = max(0, top - pad), min(h, bottom + 1 + pad)
+    return fitz.Rect(pr.x0 + x0 / k, pr.y0 + y0 / k, pr.x0 + x1 / k, pr.y0 + y1 / k) & pr
+
+
+def _draw_page_banded(painter, page, dest, r, rotation=0, grayscale=False, compress=False):
     """Draw `page` rasterised at r px/pt into dest=(x, y, w, h) device pixels, in horizontal strips so a
     huge sheet (A0, a plotter roll) never needs one giant bitmap. Rotation is applied to the page
-    content around its center; the paper layout itself is unchanged."""
+    content around its center; the paper layout itself is unchanged.
+    compress=True sends far less data to the printer without touching quality: only the area that
+    holds content is rendered and sent, strips that are pure white are skipped (the paper is already
+    white), and grayscale pages are rendered straight to 8-bit gray."""
     pr = page.rect
     dx, dy, dw, dh = dest
     rotation %= 360
+    source, box = page, pr
+    if compress:
+        source = page.get_displaylist()                       # parse the page once, reuse it for every strip
+        box = _content_box(source, pr)
+        if box is None:
+            return                                            # nothing visible on this page
     if rotation:
         cx, cy = dx + dw / 2, dy + dh / 2
         painter.save()
@@ -1209,16 +1244,36 @@ def _draw_page_banded(painter, page, dest, r, rotation=0, grayscale=False):
             dx, dy, dw, dh = cx - dh / 2, cy - dw / 2, dh, dw
     full_w, full_h = max(1, round(pr.width * r)), max(1, round(pr.height * r))
     rows = max(1, min(full_h, int(MAX_BAND_PIXELS // full_w)))
-    sy = dh / full_h
-    y = 0
-    while y < full_h:
-        n = min(rows, full_h - y)
-        clip = fitz.Rect(pr.x0, pr.y0 + y / r, pr.x1, pr.y0 + min(pr.height, (y + n) / r))
-        img = pix_to_qimage(page.get_pixmap(matrix=fitz.Matrix(r, r), clip=clip, alpha=False))
-        if grayscale:
-            img = img.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_RGB32)
+    sx, sy = dw / full_w, dh / full_h
+    if compress:
+        rows = min(rows, 384)
+        x0, x1 = max(0, int((box.x0 - pr.x0) * r)), min(full_w, math.ceil((box.x1 - pr.x0) * r))
+        y, y_end = max(0, int((box.y0 - pr.y0) * r)), min(full_h, math.ceil((box.y1 - pr.y0) * r))
+        cs = fitz.csGRAY if grayscale else fitz.csRGB
+    else:
+        x0, x1, y, y_end = 0, full_w, 0, full_h
+    while y < y_end:
+        n = min(rows, y_end - y)
+        if compress:
+            clip = fitz.Rect(pr.x0 + x0 / r, pr.y0 + y / r, pr.x0 + x1 / r, pr.y0 + min(pr.height, (y + n) / r))
+            pix = source.get_pixmap(matrix=fitz.Matrix(r, r), clip=clip, colorspace=cs, alpha=False)
+            samples = pix.samples
+            if samples.count(b"\xff") == len(samples):         # pure white strip: print nothing
+                y += n
+                continue
+            if grayscale:
+                img = QImage(samples, pix.width, pix.height, pix.stride, QImage.Format.Format_Grayscale8).copy()
+            else:
+                img = pix_to_qimage(pix)
+            left, width = dx + x0 * sx, (x1 - x0) * sx
+        else:
+            clip = fitz.Rect(pr.x0, pr.y0 + y / r, pr.x1, pr.y0 + min(pr.height, (y + n) / r))
+            img = pix_to_qimage(page.get_pixmap(matrix=fitz.Matrix(r, r), clip=clip, alpha=False))
+            if grayscale:
+                img = img.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_RGB32)
+            left, width = dx, dw
         top, bottom = round(dy + y * sy), round(dy + (y + n) * sy)
-        painter.drawImage(QRectF(dx, top, dw, max(1, bottom - top)), img)
+        painter.drawImage(QRectF(left, top, width, max(1, bottom - top)), img)
         y += n
     if rotation:
         painter.restore()
@@ -1314,7 +1369,7 @@ def _print_pdf(parent, doc, st, docname, driver_mode=False):
                 painter.setClipRect(QRectF(cx * px_per_pt, cy * px_per_pt, cw * px_per_pt, ch * px_per_pt))
                 _draw_page_banded(painter, doc[pno],
                                   (tx * px_per_pt, ty * px_per_pt, dw * px_per_pt, dh * px_per_pt),
-                                  r, rotation, st.get("grayscale", False))
+                                  r, rotation, st.get("grayscale", False), st.get("compress", False))
     finally:
         painter.end()
     if canceled:
@@ -1430,6 +1485,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.ck_save_toner = QCheckBox("SAVE TONER")
         self.ck_save_toner.setToolTip("Requests the printer's Draft mode and 150 dpi output; "
                                       "the driver must support Draft mode.")
+        self.ck_compress = QCheckBox("COMPRESS")
+        self.ck_compress.setToolTip("Sends much less data to the printer so the job starts printing sooner,\n"
+                                    "with no change in print quality: only the part of each page that has\n"
+                                    "content is sent, blank areas are skipped and gray pages go as 8-bit gray.")
         self.ck_grayscale = QCheckBox("GRAY SCALE")
         self.ck_grayscale.setToolTip("Print in grayscale (black and white); also changes the preview.")
         self.sp_copies = QSpinBox()
@@ -1542,6 +1601,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         copies_row.addSpacing(16)
         copies_row.addWidget(self.ck_grayscale)
         copies_row.addWidget(self.ck_save_toner)
+        copies_row.addWidget(self.ck_compress)
         copies_row.addStretch(1)
         w_copies = QWidget()
         w_copies.setLayout(copies_row)
@@ -1724,7 +1784,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
     def _printer_changed(self, *_):
         self.devmode_blob = None
         self._printer_options_touched = False
-        for checkbox in (self.ck_save_toner, self.ck_grayscale):
+        for checkbox in (self.ck_save_toner, self.ck_grayscale, self.ck_compress):
             old = checkbox.blockSignals(True)
             checkbox.setChecked(False)
             checkbox.blockSignals(old)
@@ -1961,6 +2021,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 self.rb_all.setChecked(True)
 
             self.ck_save_toner.setChecked(prefs.get("save_toner", False))
+            self.ck_compress.setChecked(prefs.get("compress", False))
             self.ck_grayscale.setChecked(prefs.get("grayscale", False))
 
             # These options and the native driver DEVMODE are specific to a printer.
@@ -2002,6 +2063,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             "offset_mm": (self.sp_ox.value(), self.sp_oy.value()),
             "image_rotation": self.image_rotation,
             "save_toner": self.ck_save_toner.isChecked(),
+            "compress": self.ck_compress.isChecked(),
             "grayscale": self.ck_grayscale.isChecked(),
             "source": self.cb_source.currentData(),
             "thick": self.cb_thick.currentData(),
@@ -2027,6 +2089,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 "scale_mode": self.cb_scale.currentData(), "scale_percent": self.sp_scale.value(),
                 "image_rotation": self.image_rotation,
                 "save_toner": save_toner, "grayscale": self.ck_grayscale.isChecked(),
+                "compress": self.ck_compress.isChecked(),
                 "per_sheet": per_sheet, "offset_mm": (self.ox_mm, self.oy_mm),
                 "pages": pg, "duplex": self.duplex_mode(ls0)}
 
