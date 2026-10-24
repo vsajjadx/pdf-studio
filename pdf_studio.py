@@ -1349,6 +1349,58 @@ class PreviewLabel(QLabel):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
 
 
+class RadioChoice(QObject):
+    """A column of radio buttons that answers like a QComboBox (currentData / findData /
+    setCurrentIndex / currentIndexChanged), so Adobe-style radio groups can replace dropdowns."""
+    currentIndexChanged = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._group = QButtonGroup(self)
+        self._buttons, self._data = [], []
+        self.box = QWidget()
+        self.layout_ = QVBoxLayout(self.box)
+        self.layout_.setContentsMargins(0, 0, 0, 0)
+        self.layout_.setSpacing(6)
+        self._group.idToggled.connect(self._toggled)
+
+    def addItem(self, text, data, extra=None):
+        btn = QRadioButton(text)
+        idx = len(self._buttons)
+        self._group.addButton(btn, idx)
+        self._buttons.append(btn)
+        self._data.append(data)
+        if extra is None:
+            self.layout_.addWidget(btn)
+        else:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(btn)
+            row.addWidget(extra)
+            row.addStretch(1)
+            self.layout_.addLayout(row)
+        if idx == 0:
+            btn.setChecked(True)
+
+    def _toggled(self, idx, checked):
+        if checked:
+            self.currentIndexChanged.emit(idx)
+
+    def currentIndex(self):
+        return self._group.checkedId()
+
+    def currentData(self):
+        i = self.currentIndex()
+        return self._data[i] if 0 <= i < len(self._data) else None
+
+    def findData(self, value):
+        return self._data.index(value) if value in self._data else -1
+
+    def setCurrentIndex(self, idx):
+        if 0 <= idx < len(self._buttons):
+            self._buttons[idx].setChecked(True)
+
+
 class PrintDialog(DarkTitleBarMixin, QDialog):
     PW, PH = 340, 470                                      # preview size
 
@@ -1403,21 +1455,21 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         rc.addWidget(self.sp_ph)
         self.lbl_custom.setVisible(False)
         self.w_custom.setVisible(False)
-        self.cb_orient = QComboBox()
-        for t, v in (("Automatic (per page)", "auto"), ("Portrait", "p"), ("Landscape", "l")):
+        self.cb_orient = RadioChoice(self)                     # Adobe: radio buttons, not a dropdown
+        for t, v in (("Auto portrait/landscape", "auto"), ("Portrait", "p"), ("Landscape", "l")):
             self.cb_orient.addItem(t, v)
 
-        self.cb_scale = QComboBox()
-        self.cb_scale.addItem("Fit to paper", "fit")
-        self.cb_scale.addItem("Actual size (100 %)", "actual")
-        self.cb_scale.addItem("Custom size…", "custom")
         self.sp_scale = QSpinBox()
         self.sp_scale.setRange(10, 400)
         self.sp_scale.setSingleStep(5)
         self.sp_scale.setValue(100)
         self.sp_scale.setSuffix(" %")
-        self.sp_scale.setToolTip("Percentage relative to \"Fit to paper\" — changing it updates "
-                                 "the preview immediately and selects Custom scale.")
+        self.sp_scale.setToolTip("Percentage relative to \"Fit\" — changing it updates "
+                                 "the preview immediately and selects Custom Scale.")
+        self.cb_scale = RadioChoice(self)
+        self.cb_scale.addItem("Fit", "fit")
+        self.cb_scale.addItem("Actual size", "actual")
+        self.cb_scale.addItem("Custom Scale:", "custom", extra=self.sp_scale)
 
         self.cb_persheet = QComboBox()
         for t, v in (("1 page per sheet (normal)", 1), ("2 pages per sheet", 2),
@@ -1441,11 +1493,26 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.ed_range = QLineEdit()
         self.ed_range.setPlaceholderText("e.g. 1-3, 5, 8-")
 
-        self.cb_duplex = QComboBox()
-        self.cb_duplex.addItem("One-sided", "none")
-        self.cb_duplex.addItem("RIGHT", "lr")
-        self.cb_duplex.addItem("UP", "tb")
-        self.cb_duplex.setToolTip("Both sides of the sheet. Needs a printer with automatic duplex.")
+        # Two-sided printing: one tick turns it on, two more ticks pick the flip edge
+        self.ck_duplex = QCheckBox("Print on both sides of paper")
+        self.ck_duplex.setToolTip("Both sides of the sheet. Needs a printer with automatic duplex.")
+        self.ck_flip_lr = QCheckBox("RIGHT")
+        self.ck_flip_lr.setToolTip("Turn the sheet over on its left / right edge.")
+        self.ck_flip_tb = QCheckBox("UP")
+        self.ck_flip_tb.setToolTip("Turn the sheet over on its top / bottom edge.")
+        self.grp_flip = QButtonGroup(self)
+        self.grp_flip.setExclusive(True)                    # exactly one flip edge stays ticked
+        self.grp_flip.addButton(self.ck_flip_lr)
+        self.grp_flip.addButton(self.ck_flip_tb)
+        self.ck_flip_lr.setChecked(True)
+        self.w_flip = QWidget()
+        flip_row = QHBoxLayout(self.w_flip)
+        flip_row.setContentsMargins(26, 0, 0, 0)
+        flip_row.setSpacing(18)
+        flip_row.addWidget(self.ck_flip_lr)
+        flip_row.addWidget(self.ck_flip_tb)
+        flip_row.addStretch(1)
+        self.w_flip.setEnabled(False)
 
         self.sp_ox = QDoubleSpinBox()
         self.sp_oy = QDoubleSpinBox()
@@ -1467,29 +1534,38 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         w_printer = QWidget()
         w_printer.setLayout(row_printer)
 
+        # Top strip, full width like Adobe: Printer + Properties, then Copies with the colour/toner ticks
         f1 = QFormLayout()
         f1.addRow("Printer:", w_printer)
-        print_options_row = QHBoxLayout()
-        print_options_row.addWidget(self.ck_save_toner)
-        print_options_row.addWidget(self.ck_grayscale)
-        print_options_row.addStretch(1)
-        print_options_widget = QWidget()
-        print_options_widget.setLayout(print_options_row)
-        f1.addRow("", print_options_widget)
-        f1.addRow("Copies:", self.sp_copies)
+        copies_row = QHBoxLayout()
+        copies_row.addWidget(self.sp_copies)
+        copies_row.addSpacing(16)
+        copies_row.addWidget(self.ck_grayscale)
+        copies_row.addWidget(self.ck_save_toner)
+        copies_row.addStretch(1)
+        w_copies = QWidget()
+        w_copies.setLayout(copies_row)
+        f1.addRow("Copies:", w_copies)
+
+        # Page Sizing & Handling: paper, size (scale) radios, pages per sheet, both-sides ticks
         f2 = QFormLayout()
         f2.addRow("Paper size:", self.cb_paper)
         f2.addRow(self.lbl_custom, self.w_custom)
-        f2.addRow("Two-sided:", self.cb_duplex)
-        f2.addRow("Orientation:", self.cb_orient)
-        f2.addRow("Scale:", self.cb_scale)
-        f2.addRow("", self.sp_scale)
         row_per = QHBoxLayout()
         row_per.addWidget(self.cb_persheet, 1)
         row_per.addWidget(self.sp_persheet)
         w_per = QWidget()
         w_per.setLayout(row_per)
         f2.addRow("Pages per sheet:", w_per)
+        v2 = QVBoxLayout()
+        v2.setSpacing(8)
+        v2.addLayout(f2)
+        v2.addWidget(QLabel("Size:"))
+        v2.addWidget(self.cb_scale.box)
+        v2.addWidget(self.ck_duplex)
+        v2.addWidget(self.w_flip)
+        v_orient = QVBoxLayout()
+        v_orient.addWidget(self.cb_orient.box)
         f3 = QVBoxLayout()
         f3.addWidget(self.rb_all)
         f3.addWidget(self.rb_cur)
@@ -1523,9 +1599,9 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.grp_media = box("Paper source, type && quality", f6)
 
         left = QVBoxLayout()
-        left.addWidget(box("Printer", f1))
-        left.addWidget(box("Paper && scale", f2))
-        left.addWidget(box("Pages", f3))
+        left.addWidget(box("Pages to Print", f3))
+        left.addWidget(box("Page Sizing && Handling", v2))
+        left.addWidget(box("Orientation", v_orient))
         left.addWidget(box("Position on page", f5))
         left.addStretch(1)
 
@@ -1584,11 +1660,14 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         main = QVBoxLayout(self)
         main.setContentsMargins(18, 14, 18, 16)
         main.setSpacing(12)
+        main.addLayout(f1)
         main.addLayout(top)
         main.addWidget(bb)
 
-        for c in (self.cb_orient, self.cb_duplex):
-            c.currentIndexChanged.connect(self.update_preview)
+        self.cb_orient.currentIndexChanged.connect(self.update_preview)
+        self.ck_duplex.toggled.connect(self._duplex_toggled)
+        self.ck_flip_lr.toggled.connect(self.update_preview)
+        self.ck_flip_tb.toggled.connect(self.update_preview)
         self.cb_paper.currentIndexChanged.connect(self._paper_changed)
         self.sp_pw.valueChanged.connect(self.update_preview)
         self.sp_ph.valueChanged.connect(self.update_preview)
@@ -1619,6 +1698,23 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
     def custom_mm(self):
         return (self.sp_pw.value(), self.sp_ph.value())
 
+    def duplex_value(self):
+        """'none' (one-sided), 'lr' (flip RIGHT) or 'tb' (flip UP), from the three ticks."""
+        if not self.ck_duplex.isChecked():
+            return "none"
+        return "lr" if self.ck_flip_lr.isChecked() else "tb"
+
+    def set_duplex_value(self, value):
+        self.ck_duplex.setChecked(value != "none")
+        if value == "tb":
+            self.ck_flip_tb.setChecked(True)
+        elif value == "lr":
+            self.ck_flip_lr.setChecked(True)
+
+    def _duplex_toggled(self, on):
+        self.w_flip.setEnabled(on)
+        self.update_preview()
+
     def _paper_changed(self, *_):
         custom = self.cb_paper.currentData() == CUSTOM_PAPER
         self.lbl_custom.setVisible(custom)
@@ -1634,7 +1730,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             checkbox.blockSignals(old)
         self.cb_paper.setCurrentIndex(self.cb_paper.findData("A4"))
         self.cb_orient.setCurrentIndex(self.cb_orient.findData("auto"))
-        self.cb_duplex.setCurrentIndex(self.cb_duplex.findData("none"))
+        self.set_duplex_value("none")
         self.sp_copies.setValue(1)
         self.sp_pw.setValue(210.0)
         self.sp_ph.setValue(297.0)
@@ -1732,9 +1828,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 landscape = dm.dmOrientation == 2 if fields & _DM_ORIENTATION else False
                 long_edge = (dm.dmDuplex == 2) != landscape
                 duplex = "lr" if long_edge else "tb"
-            idx = self.cb_duplex.findData(duplex)
-            if idx >= 0:
-                self.cb_duplex.setCurrentIndex(idx)
+            self.set_duplex_value(duplex)
         if fields & _DM_COLOR and dm.dmSize >= _DM_COLOR_END:
             old = self.ck_grayscale.blockSignals(True)
             self.ck_grayscale.setChecked(dm.dmColor == _DMCOLOR_MONOCHROME)
@@ -1824,7 +1918,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.update_preview()
 
     def duplex_mode(self, first_landscape):
-        d = self.cb_duplex.currentData()
+        d = self.duplex_value()
         if d == "none":
             return QPrinter.DuplexMode.DuplexNone
         # "left/right edge" is the long edge of a portrait sheet and the short edge of a landscape one
@@ -1852,7 +1946,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             self._select_data(self.cb_scale, prefs.get("scale_mode", "fit"))
             self._select_data(self.cb_persheet, prefs.get("per_sheet_mode", 1))
             self.sp_persheet.setValue(prefs.get("per_sheet_custom", self.sp_persheet.value()))
-            self._select_data(self.cb_duplex, prefs.get("duplex", "none"))
+            self.set_duplex_value(prefs.get("duplex", "none"))
             self.sp_ox.setValue(prefs.get("offset_mm", (0.0, 0.0))[0])
             self.sp_oy.setValue(prefs.get("offset_mm", (0.0, 0.0))[1])
             self.image_rotation = prefs.get("image_rotation", 0)
@@ -1904,7 +1998,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             "per_sheet_custom": self.sp_persheet.value(),
             "pages_mode": pages_mode,
             "range_text": self.ed_range.text(),
-            "duplex": self.cb_duplex.currentData(),
+            "duplex": self.duplex_value(),
             "offset_mm": (self.sp_ox.value(), self.sp_oy.value()),
             "image_rotation": self.image_rotation,
             "save_toner": self.ck_save_toner.isChecked(),
@@ -2152,7 +2246,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         ps = page_size_for(paper_key, self.custom_mm()).size(QPageSize.Unit.Point)
         paper_label = "{:g} × {:g} mm".format(*self.custom_mm()) if paper_key == CUSTOM_PAPER else paper_key
         pw, ph = (ps.height(), ps.width()) if ls else (ps.width(), ps.height())
-        duplex = self.cb_duplex.currentData()
+        duplex = self.duplex_value()
         back = duplex != "none" and self.pv % 2 == 1
         pad = 20 if duplex == "none" else 84                               # extra room for the curl
         k = min((self.PW - pad) / pw, (self.PH - pad) / ph)                # preview px per point
@@ -2214,7 +2308,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
         rng = f"{sheet[0] + 1}" + (f"–{sheet[-1] + 1}" if len(sheet) > 1 else "")
         info = f"Sheet {self.pv + 1} / {len(grp)}  •  page(s) {rng}  •  {paper_label} {'landscape' if ls else 'portrait'}"
-        if self.cb_duplex.currentData() != "none":
+        if duplex != "none":
             info += f"\nsheet {self.pv // 2 + 1}, {'front' if self.pv % 2 == 0 else 'back'}"
         self.lbl_info.setText(info)
 
