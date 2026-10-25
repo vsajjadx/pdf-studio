@@ -716,7 +716,7 @@ QStatusBar { background:$SURFACE; border-top:1px solid $LINE; color:$TEXT2; padd
 QStatusBar::item { border:none; }
 QLabel#StatusPill { background:transparent; border:none; padding:3px 12px; color:$TEXT; }
 QWidget#PageBar { background:$SURFACE; }
-QLabel#PageText { background:transparent; border:none; color:$TEXT2; font-size:15px; font-weight:600; }
+QLabel#PageText { background:transparent; border:none; color:$TEXT2; font-size:22px; font-weight:700; }
 QLineEdit#PageBox { font-size:16px; font-weight:700; padding:1px 6px; min-height:24px; border-radius:6px; }
 
 /* ---------- panels ---------- */
