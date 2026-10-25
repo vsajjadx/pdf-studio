@@ -460,7 +460,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QDi
                              QGridLayout, QGroupBox, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QRadioButton,
-                             QScrollArea, QAbstractItemView, QSpinBox, QSplitter,
+                             QScrollArea, QAbstractItemView, QSpinBox, QSplitter, QStyledItemDelegate,
                              QStackedWidget, QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 PAGE_GAP = 12      # px between pages in the continuous view
@@ -2404,6 +2404,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
     def reset_offset(self):
         self.zoom = 1.0
+        self.image_rotation = 0                       # undo button / Shift+drag rotation too
         self.cb_scale.blockSignals(True)
         self.cb_scale.setCurrentIndex(max(0, self.cb_scale.findData("fit")))
         self.cb_scale.blockSignals(False)
@@ -3079,8 +3080,28 @@ class ZoomScroll(QScrollArea):
             e.ignore()
 
 
+THUMB_STRIP = 44            # px of every page thumbnail that stays visible in the stacked strip (its top edge)
+THUMB_PAD = 5               # px above each thumbnail inside its strip slot
+THUMB_BOX = QSize(118, 160) # largest size of a thumbnail
+
+
+class _NoPaintDelegate(QStyledItemDelegate):
+    """ThumbList paints its own overlapping pages (ThumbList.paintEvent); items only supply geometry."""
+    def paint(self, painter, option, index):
+        pass
+
+    def sizeHint(self, option, index):
+        s = index.data(Qt.ItemDataRole.SizeHintRole)
+        return s if isinstance(s, QSize) else QSize(140, THUMB_STRIP)
+
+
+def _ease(p):
+    return p * p * (3.0 - 2.0 * p)
+
+
 class ThumbList(QListWidget):
-    """Thumbnail strip; accepts PDF/image files dropped between thumbnails."""
+    """Thumbnail strip: pages are stacked on top of each other so only the top edge of each shows; the page
+    under the mouse slides open smoothly. Accepts PDF/image files dropped between thumbnails."""
     files_drop = pyqtSignal(list, int)               # paths, insertion index
     layout_changed = pyqtSignal()                    # scrolled / resized -> reposition delete buttons
     pages_moved = pyqtSignal(list, int)              # dragged rows, destination slot (0..n)
@@ -3096,26 +3117,190 @@ class ThumbList(QListWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.setObjectName("Thumbs")
-        self.setSpacing(4)
+        self.setSpacing(0)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setItemDelegate(_NoPaintDelegate(self))
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.verticalScrollBar().setSingleStep(24)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self.itemSelectionChanged.connect(self.viewport().update)
         self.export_drag_index = None
+        self._pm_cache = {}                          # QIcon cache key -> scaled page pixmap
+        self._prog = {}                              # row -> how far its page has slid open (0..1)
+        self._hover = None                           # row the mouse is on
+        self._anim = QTimer(self)
+        self._anim.setInterval(16)
+        self._anim.timeout.connect(self._tick)
         self._line = QFrame(self.viewport())
         self._line.setStyleSheet(f"background:{ACCENT};border-radius:2px")
         self._line.hide()
 
     def scrollContentsBy(self, dx, dy):
         super().scrollContentsBy(dx, dy)
+        self._hover_from_cursor()                    # the wheel moves pages under a still mouse
         self.layout_changed.emit()
+
+    # ---------- stacked pages: geometry, hover animation, painting ----------
+    def _pm(self, row):
+        it = self.item(row)
+        if it is None:
+            return None
+        ic = it.icon()
+        key = ic.cacheKey()
+        pm = self._pm_cache.get(key)
+        if pm is None:
+            if len(self._pm_cache) > 600:
+                self._pm_cache.clear()
+            pm = ic.pixmap(THUMB_BOX)
+            self._pm_cache[key] = pm
+        return pm
+
+    def thumb_rect(self, row):
+        """Full rectangle of the page thumbnail `row` (viewport coordinates); most of it is covered by the next page."""
+        it = self.item(row)
+        pm = self._pm(row)
+        if it is None or pm is None or pm.isNull():
+            return None
+        sz = pm.deviceIndependentSize()
+        vr = self.visualItemRect(it)
+        return QRectF((self.viewport().width() - sz.width()) / 2.0, vr.top() + THUMB_PAD, sz.width(), sz.height())
+
+    def _reveal_rect(self, row, prog):
+        r = self.thumb_rect(row)
+        if r is None:
+            return None
+        base = min(r.height(), THUMB_STRIP - THUMB_PAD)
+        return QRectF(r.x(), r.y(), r.width(), base + (r.height() - base) * _ease(prog))
+
+    def covered_by_reveal(self, row, rect):
+        """True if a page that is sliding open lies over `rect` (a QRectF) of the page `row`."""
+        for h, prog in self._prog.items():
+            if h < row and prog > 0:
+                rr = self._reveal_rect(h, prog)
+                if rr is not None and rr.intersects(rect):
+                    return True
+        return False
+
+    def indexAt(self, pos):
+        h = getattr(self, "_hover", None)               # Qt may call this while the widget is still being built
+        if h is not None and self._prog.get(h, 0) > 0:
+            rr = self._reveal_rect(h, self._prog[h])
+            if rr is not None and rr.contains(QPointF(pos)):
+                return self.model().index(h, 0)         # the opened page owns the area it covers
+        return super().indexAt(pos)
+
+    def _set_hover(self, row):
+        if row == self._hover:
+            return
+        self._hover = row
+        if row is not None:
+            self._prog.setdefault(row, 0.0)
+        if not self._anim.isActive():
+            self._anim.start()
+
+    def _hover_from(self, pos):
+        row = self.indexAt(pos).row()
+        self._set_hover(row if row >= 0 else None)
+
+    def _hover_from_cursor(self):
+        vp = self.viewport()
+        if vp.underMouse():
+            self._hover_from(vp.mapFromGlobal(QCursor.pos()))
+
+    def _tick(self):
+        for row, p in list(self._prog.items()):
+            tgt = 1.0 if row == self._hover else 0.0
+            p = min(tgt, p + 0.14) if p < tgt else max(tgt, p - 0.14)
+            if p <= 0.0 and tgt == 0.0:
+                del self._prog[row]
+            else:
+                self._prog[row] = p
+        if all(row == self._hover and p >= 1.0 for row, p in self._prog.items()):
+            self._anim.stop()
+        self.viewport().update()
+        self.layout_changed.emit()
+
+    def mouseMoveEvent(self, e):
+        super().mouseMoveEvent(e)
+        if not (e.buttons() & Qt.MouseButton.LeftButton):
+            self._hover_from(e.position().toPoint())
+
+    def leaveEvent(self, e):
+        self._set_hover(None)
+        super().leaveEvent(e)
+
+    def _draw_thumb(self, p, row, shown_h, prog):
+        full = self.thumb_rect(row)
+        pm = self._pm(row)
+        if full is None:
+            return
+        shown = QRectF(full.x(), full.y(), full.width(), min(shown_h, full.height()))
+        a_top = 70 if T["DARK"] else 45
+        g = QLinearGradient(0, shown.top() - 7, 0, shown.top())          # this page casts a shadow on the one below it
+        g.setColorAt(0, QColor(0, 0, 0, 0))
+        g.setColorAt(1, QColor(0, 0, 0, a_top))
+        p.fillRect(QRectF(shown.x() - 1, shown.top() - 7, shown.width() + 2, 7), QBrush(g))
+        if prog > 0:
+            g2 = QLinearGradient(0, shown.bottom(), 0, shown.bottom() + 12)
+            g2.setColorAt(0, QColor(0, 0, 0, int(90 * prog)))
+            g2.setColorAt(1, QColor(0, 0, 0, 0))
+            p.fillRect(QRectF(shown.x() - 1, shown.bottom(), shown.width() + 2, 12), QBrush(g2))
+        p.save()
+        p.setClipRect(shown, Qt.ClipOperation.IntersectClip)
+        p.drawPixmap(full.topLeft(), pm)
+        selected = self.selectionModel().isSelected(self.model().index(row, 0))
+        if selected:
+            p.setPen(QPen(QColor(ACCENT), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(full.adjusted(1, 1, -1, -1))
+        f = p.font()
+        f.setPixelSize(10)
+        f.setBold(True)
+        p.setFont(f)
+        txt = str(row + 1)
+        w = max(18, p.fontMetrics().horizontalAdvance(txt) + 10)
+        badge = QRectF(full.right() - w - 4, full.top() + 4, w, 16)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(ACCENT) if selected else QColor(0, 0, 0, 160))
+        p.drawRoundedRect(badge, 8, 8)
+        p.setPen(QColor("white"))
+        p.drawText(badge, Qt.AlignmentFlag.AlignCenter, txt)
+        p.restore()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)                        # background only: the delegate paints nothing
+        n = self.count()
+        if not n:
+            return
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.setClipRegion(e.region())
+        vh = self.viewport().height()
+        first = max(0, (self.verticalScrollBar().value() - 6) // THUMB_STRIP - 5)
+        for row in range(first, n):                  # stacked: every page lies over the one before it
+            r = self.thumb_rect(row)
+            if r is None:
+                continue
+            if r.top() - 8 > vh:
+                break
+            self._draw_thumb(p, row, r.height(), 0.0)
+        for row, prog in sorted(self._prog.items(), key=lambda kv: (kv[0] == self._hover, kv[1])):
+            rr = self._reveal_rect(row, prog)        # pages sliding open are drawn over the stack
+            if rr is not None and rr.bottom() > 0 and rr.top() < vh:
+                self._draw_thumb(p, row, rr.height(), prog)
+        p.end()
 
     def updateGeometries(self):
         super().updateGeometries()
         self.layout_changed.emit()
 
     def contextMenuEvent(self, e):
-        it = self.itemAt(e.pos())
-        if it is not None:
-            self.context_requested.emit(self.row(it), e.globalPos())
+        idx = self.indexAt(e.pos())
+        if idx.isValid():
+            self.context_requested.emit(idx.row(), e.globalPos())
         e.accept()
 
     def _slot(self, e):
@@ -3142,6 +3327,7 @@ class ThumbList(QListWidget):
                 and e.mimeData().hasFormat("application/x-pdfstudio-page-reorder"))
 
     def startDrag(self, supportedActions):
+        self._set_hover(None)
         rows = sorted({self.row(item) for item in self.selectedItems()})
         if rows:
             # DocTab supplies real file URLs so Explorer can receive the pages.
@@ -3398,10 +3584,14 @@ class DocTab(QWidget):
         self.thumbs.clear()
         for i in range(len(self.doc)):
             item = QListWidgetItem(self.thumb_icon(i), str(i + 1))
-            item.setSizeHint(QSize(140, 180))                 # room for the padding around each thumbnail
+            item.setSizeHint(QSize(140, THUMB_STRIP))         # stacked pages: each page owns only its top strip
             item.setToolTip(f"Drag page {i + 1} to a folder or the Desktop to export it. "
                             "Select several pages to export them together.")
             self.thumbs.addItem(item)
+        last = self.thumbs.item(self.thumbs.count() - 1)
+        if last is not None:                                  # the last page has nothing over it: give it full height
+            lh = last.icon().pixmap(THUMB_BOX).deviceIndependentSize().height()
+            last.setSizeHint(QSize(140, max(THUMB_STRIP, int(lh) + THUMB_PAD + 8)))
         self.cur = max(0, min(keep, len(self.doc) - 1))
         self.thumbs.setCurrentRow(self.cur)
         self.thumbs.blockSignals(False)
@@ -3468,11 +3658,15 @@ class DocTab(QWidget):
             if it is None:
                 b.hide()
                 continue
-            r = self.thumbs.visualItemRect(it)
-            if r.bottom() < 0 or r.top() > vp.height():
+            r = self.thumbs.thumb_rect(i)
+            if r is None or r.top() + 30 < 0 or r.top() > vp.height():
                 b.hide()
                 continue
-            b.move(r.left() + 4, r.top() + 11)                 # inside the thumbnail, top-left corner
+            spot = QRectF(r.left() + 4, r.top() + 4, 24, 24)   # inside the thumbnail, top-left corner
+            if self.thumbs.covered_by_reveal(i, spot):         # another page is sliding open over this corner
+                b.hide()
+                continue
+            b.move(int(spot.left()), int(spot.top()))
             b.show()
             b.raise_()
 
@@ -4311,6 +4505,7 @@ class DocTab(QWidget):
         self._objs.pop(idx, None)
         self.render_page(idx, force=True)
         self.thumbs.item(idx).setIcon(self.thumb_icon(idx))
+        self.thumbs.viewport().update()
         self.edit_page = idx
         self.edit_sel = []
         if select_rects:
