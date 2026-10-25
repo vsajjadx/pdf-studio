@@ -3241,7 +3241,7 @@ class DocTab(QWidget):
             if r.bottom() < 0 or r.top() > vp.height():
                 b.hide()
                 continue
-            b.move(r.left() + 7, r.top() + 12)                 # inside the thumbnail, top-left corner
+            b.move(r.left() + 4, r.top() + 11)                 # inside the thumbnail, top-left corner
             b.show()
             b.raise_()
 
