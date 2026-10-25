@@ -5,7 +5,7 @@ PDF Studio - PDF reader/editor for Windows
   * drag pages from the preview to export as separate PDF or JPG files
   * edit text lines, delete / add / move / rotate pages, insert PDFs, undo
   * built-in print dialog: printer, A0-A5 + custom size, orientation, scale, page range, duplex,
-    paper source (e.g. bypass tray), THICK 1/2/3, paper type + print quality (plotters),
+    paper source (auto / bypass tray), paper type,
     save-toner and grayscale modes, flip on left/right or top/bottom edge, and live preview
   * Explorer right-click: combine multiple PDFs/images, or open a single selection directly
   * single window: opening another PDF while the app is running adds a new tab
@@ -891,7 +891,7 @@ class EmptyState(QWidget):
         outer.addStretch(1)
 
 
-# ---- Windows printer-driver access: paper source, paper type (THICK…), print quality ----------
+# ---- Windows printer-driver access: paper source, paper type, print quality ----------
 import ctypes
 
 _DM_IN_PROMPT, _DM_OUT_BUFFER, _DM_IN_BUFFER = 4, 2, 8
@@ -1363,7 +1363,7 @@ def _draw_page_banded(painter, page, dest, r, rotation=0, grayscale=False, compr
 
 def print_pdf(parent, doc, st, docname):
     """Send the pages in st['pages'] to the printer chosen in the dialog, st['per_sheet']
-    pages at a time per physical sheet.  Paper source / paper type (THICK…) / quality from the
+    pages at a time per physical sheet.  Paper source / paper type / quality from the
     dialog are applied through the driver's DEVMODE (Windows) for the duration of the job."""
     req = st.get("driver") or {}
     ws = _WinSpool.get()
@@ -1503,14 +1503,15 @@ class RadioChoice(QObject):
     setCurrentIndex / currentIndexChanged), so Adobe-style radio groups can replace dropdowns."""
     currentIndexChanged = pyqtSignal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, horizontal=False):
         super().__init__(parent)
         self._group = QButtonGroup(self)
         self._buttons, self._data = [], []
+        self._horizontal = horizontal
         self.box = QWidget()
-        self.layout_ = QVBoxLayout(self.box)
+        self.layout_ = QHBoxLayout(self.box) if horizontal else QVBoxLayout(self.box)
         self.layout_.setContentsMargins(0, 0, 0, 0)
-        self.layout_.setSpacing(6)
+        self.layout_.setSpacing(10 if horizontal else 6)
         self._group.idToggled.connect(self._toggled)
 
     def addItem(self, text, data, extra=None):
@@ -1519,7 +1520,11 @@ class RadioChoice(QObject):
         self._group.addButton(btn, idx)
         self._buttons.append(btn)
         self._data.append(data)
-        if extra is None:
+        if self._horizontal:
+            self.layout_.addWidget(btn)
+            if extra is not None:
+                self.layout_.addWidget(extra)
+        elif extra is None:
             self.layout_.addWidget(btn)
         else:
             row = QHBoxLayout()
@@ -1551,7 +1556,7 @@ class RadioChoice(QObject):
 
 
 class PrintDialog(DarkTitleBarMixin, QDialog):
-    PW, PH = 330, 360                                      # preview size (compact, landscape dialog)
+    PW, PH = 290, 300                                      # preview size (compact, landscape dialog)
 
     def __init__(self, parent, doc, cur, preset=None, initial_preferences=None):
         super().__init__(parent)
@@ -1618,9 +1623,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_scale.setSingleStep(5)
         self.sp_scale.setValue(100)
         self.sp_scale.setSuffix(" %")
+        self.sp_scale.setMaximumWidth(86)
         self.sp_scale.setToolTip("Percentage relative to \"Fit\" — changing it updates "
                                  "the preview immediately and selects Custom Scale.")
-        self.cb_scale = RadioChoice(self)
+        self.cb_scale = RadioChoice(self, horizontal=True)       # Fit | Actual size | Custom Scale in one line
         self.cb_scale.addItem("Fit", "fit")
         self.cb_scale.addItem("Actual size", "actual")
         self.cb_scale.addItem("Custom Scale:", "custom", extra=self.sp_scale)
@@ -1682,17 +1688,36 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             g.setLayout(form)
             return g
 
+        # paper source (AUTO / BYPASS TRAY) and paper type, filled from what the chosen driver reports;
+        # quality has no control any more, it only follows the driver's own settings window
+        self.devmode_blob = None                           # settings captured from the driver's own window
+        self._caps = {"bins": [], "media": [], "dpis": []}
+        self.cb_source, self.cb_media, self.cb_quality = QComboBox(), QComboBox(), QComboBox()
+        self.cb_quality.setVisible(False)
+        for cb in (self.cb_source, self.cb_media):
+            cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(4)
+            cb.setFixedWidth(122)
+
         row_printer = QHBoxLayout()
-        self.cb_printer.setMaximumWidth(220)                    # compact printer drop-down
+        self.cb_printer.setMaximumWidth(140)                    # compact printer drop-down
         self.cb_printer.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.cb_printer.setMinimumContentsLength(14)
+        self.cb_printer.setMinimumContentsLength(8)
         row_printer.addWidget(self.cb_printer, 1)
         row_printer.addSpacing(8)
         row_printer.addWidget(QLabel("Paper size:"))            # paper size sits between printer and Settings
+        self.cb_paper.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cb_paper.setMinimumContentsLength(7)
+        self.cb_paper.setFixedWidth(84)
         row_printer.addWidget(self.cb_paper)
+        row_printer.addSpacing(4)
+        row_printer.addWidget(QLabel("Paper source:"))
+        row_printer.addWidget(self.cb_source)
+        row_printer.addSpacing(8)
+        row_printer.addWidget(QLabel("Paper type:"))
+        row_printer.addWidget(self.cb_media)
         row_printer.addSpacing(8)
         row_printer.addWidget(self.btn_printer_props)
-        row_printer.addStretch(1)
         w_printer = QWidget()
         w_printer.setLayout(row_printer)
 
@@ -1738,34 +1763,15 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         row.addWidget(self.ed_range)
         f3.addLayout(row)
 
-        # paper source / THICK / paper type / quality (filled from what the chosen driver reports)
-        self.devmode_blob = None                           # settings captured from the driver's own window
-        self._caps = {"bins": [], "media": [], "dpis": []}
-        self.cb_source, self.cb_thick = QComboBox(), QComboBox()
-        self.cb_media, self.cb_quality = QComboBox(), QComboBox()
-        for t, v in (("Off (normal paper)", 0), ("THICK 1", 1), ("THICK 2", 2), ("THICK 3", 3)):
-            self.cb_thick.addItem(t, v)
-        self.cb_thick.setToolTip("Heavy paper mode (e.g. Konica Minolta bypass tray). Uses the driver's\n"
-                                 "paper type called THICK 1 / 2 / 3.")
-        self.lbl_media = QLabel()
-        self.lbl_media.setWordWrap(True)
-        self.lbl_media.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
-        f6 = QFormLayout()
-        f6.addRow("Paper source:", self.cb_source)
-        f6.addRow("THICK:", self.cb_thick)
-        f6.addRow("Paper type:", self.cb_media)
-        f6.addRow("Quality:", self.cb_quality)
-        f6.addRow(self.lbl_media)
-        self.grp_media = box("Paper source, type && quality", f6)
-
-        left_a = QVBoxLayout()                                 # column 1
-        left_a.addWidget(box("Pages to Print", f3))
-        left_a.addWidget(box("Orientation", v_orient))
-        left_a.addWidget(self.grp_media)                       # takes the old "Position on page" spot
-        left_a.addStretch(1)
-        left_b = QVBoxLayout()                                 # column 2
-        left_b.addWidget(box("Page Sizing && Handling", v2))
-        left_b.addStretch(1)
+        row_pg = QHBoxLayout()                                   # Pages to Print | Orientation, side by side
+        row_pg.setSpacing(10)
+        row_pg.addWidget(box("Pages to Print", f3), 1)
+        row_pg.addWidget(box("Orientation", v_orient), 1)
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addLayout(row_pg)
+        left.addWidget(box("Page Sizing && Handling", v2))
+        left.addStretch(1)
 
         self.lbl_pv = PreviewLabel()
         self.lbl_pv.setFixedSize(self.PW, self.PH)
@@ -1819,16 +1825,18 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
 
+        left.addWidget(bb)                                       # Print / Cancel under the settings
         top = QHBoxLayout()
-        top.addLayout(left_a, 0)
-        top.addLayout(left_b, 0)
+        top.setSpacing(16)
+        top.addLayout(left, 0)
         top.addLayout(right, 0)
         main = QVBoxLayout(self)
-        main.setContentsMargins(18, 14, 18, 16)
-        main.setSpacing(12)
+        main.setContentsMargins(16, 12, 16, 12)
+        main.setSpacing(8)
         main.addLayout(f1)
         main.addLayout(top)
-        main.addWidget(bb)
+        # tighter group boxes than the main window uses, so the whole dialog stays small
+        self.setStyleSheet("QGroupBox{padding:28px 10px 8px 10px;}QGroupBox::title{top:7px;}")
 
         self.cb_orient.currentIndexChanged.connect(self.update_preview)
         self.ck_duplex.toggled.connect(self._duplex_toggled)
@@ -1840,7 +1848,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.cb_printer.currentIndexChanged.connect(self._printer_changed)
         self.ck_save_toner.toggled.connect(self._printer_options_changed)
         self.ck_grayscale.toggled.connect(self._printer_options_changed)
-        self.cb_thick.currentIndexChanged.connect(self._thick_changed)
         self.cb_scale.currentIndexChanged.connect(self._scale_mode_changed)
         self.sp_scale.valueChanged.connect(self._custom_scale_changed)
         self.cb_persheet.currentIndexChanged.connect(self._persheet_mode_changed)
@@ -1902,18 +1909,16 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_copies.setValue(1)
         self.sp_pw.setValue(210.0)
         self.sp_ph.setValue(297.0)
-        self.cb_thick.setCurrentIndex(self.cb_thick.findData(0))
         self._load_caps()
 
     def _load_caps(self):
         ws, name = _WinSpool.get(), self.cb_printer.currentText()
         self._caps = (ws.caps(name) if ws and name else None) or {"bins": [], "media": [], "dpis": []}
         self.cb_source.clear()
-        self.cb_source.addItem("Printer default (auto)", None)
-        for n, i in self._caps["bins"]:
-            self.cb_source.addItem(n, i)
+        self.cb_source.addItem("AUTO", None)
+        self.cb_source.addItem("BYPASS TRAY", self._bypass_bin())
         self.cb_media.clear()
-        self.cb_media.addItem("Printer default", None)
+        self.cb_media.addItem("Default", None)
         for n, i in self._caps["media"]:
             self.cb_media.addItem(n, i)
         self.cb_quality.clear()
@@ -1922,8 +1927,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             self.cb_quality.addItem(t, ("q", v, dpi, None))
         for x, y in self._caps["dpis"][-6:]:
             self.cb_quality.addItem(f"{x} × {y} dpi" if x != y else f"{x} dpi", ("dpi", x, min(x, 600), y))
-        self.grp_media.setEnabled(bool(ws))
-        self.grp_media.setToolTip("" if ws else "Paper source / paper type / quality need the Windows printer driver.")
+        tip = "" if ws else "Paper source / paper type need the Windows printer driver."
+        for cb in (self.cb_source, self.cb_media):
+            cb.setEnabled(bool(ws))
+            cb.setToolTip(tip)
         default_blob = None
         if ws and name:
             h = ws.open(name)
@@ -1933,7 +1940,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 finally:
                     ws.close(h)
         self._sync_driver_settings(default_blob, include_advanced=False)
-        self._thick_changed()
 
     def _sync_driver_settings(self, blob, include_advanced=True):
         """Reflect the selected printer's DEVMODE in the page controls and live preview."""
@@ -2011,9 +2017,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 media_idx = self.cb_media.findData(dm.dmMediaType)
                 if media_idx >= 0:
                     self.cb_media.setCurrentIndex(media_idx)
-                    thick = next((n for n in (1, 2, 3)
-                                  if self._find_thick(n) and self._find_thick(n)[1] == dm.dmMediaType), 0)
-                    self.cb_thick.setCurrentIndex(self.cb_thick.findData(thick))
             if fields & _DM_PRINTQUALITY:
                 quality_idx = -1
                 for i in range(self.cb_quality.count()):
@@ -2029,36 +2032,20 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                             break
                 if quality_idx >= 0:
                     self.cb_quality.setCurrentIndex(quality_idx)
-        self._thick_changed()
         self.update_preview()
 
-    def _find_thick(self, n):
-        pat = re.compile(r"thick\s*[-_ ]?\s*%d(?![\d+])" % n, re.I)
-        for name, mid in self._caps["media"]:
+    def _bypass_bin(self):
+        """Driver id of the bypass / manual-feed tray: the tray whose name says so, else the standard
+        Windows 'manual feed' bin."""
+        pat = re.compile(r"by-?\s*pass|manual|multi|\bmp\b|\bmpt\b", re.I)
+        for name, bid in self._caps["bins"]:
             if pat.search(name):
-                return name, mid
-        return None
-
-    def _thick_changed(self, *_):
-        n = self.cb_thick.currentData() or 0
-        self.cb_media.setEnabled(not n)
-        found = self._find_thick(n) if n else None
-        if not n:
-            msg = "Tip: ⚙ Settings… opens the driver window; what you choose there is used for printing."
-        elif found:
-            msg = f"Paper type will be set to “{found[0]}”."
-        elif self.devmode_blob:
-            msg = "Using the paper type you chose in the driver's settings window."
-        else:
-            msg = (f"This driver doesn't list THICK {n} as a standard paper type. Click ⚙ Settings…, pick it "
-                   f"in the driver window and press OK — that choice is then used when printing.")
-        self.lbl_media.setText(msg)
+                return bid
+        return 4                                           # DMBIN_MANUAL
 
     def driver_request(self):
-        n = self.cb_thick.currentData() or 0
-        media = (self._find_thick(n) or (None, None))[1] if n else self.cb_media.currentData()
         return {"blob": self.devmode_blob, "source": self.cb_source.currentData(),
-                "media": media, "quality": self.cb_quality.currentData(),
+                "media": self.cb_media.currentData(), "quality": self.cb_quality.currentData(),
                 "save_toner": self.ck_save_toner.isChecked(),
                 "grayscale": self.ck_grayscale.isChecked(),
                 "options_touched": self._printer_options_touched}
@@ -2135,7 +2122,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             # These options and the native driver DEVMODE are specific to a printer.
             if prefs.get("printer") == self.cb_printer.currentText():
                 self._select_data(self.cb_source, prefs.get("source"))
-                self._select_data(self.cb_thick, prefs.get("thick", 0))
                 self._select_data(self.cb_media, prefs.get("media"))
                 self._select_data(self.cb_quality, prefs.get("quality"))
                 self.devmode_blob = prefs.get("devmode_blob")
@@ -2150,7 +2136,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 self.rb_range.setChecked(True)
         self._persheet_mode_changed()
         self._paper_changed()
-        self._thick_changed()
 
     def preferences(self):
         """Snapshot every user-facing print option for reuse until this app closes."""
@@ -2174,7 +2159,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             "compress": self.ck_compress.isChecked(),
             "grayscale": self.ck_grayscale.isChecked(),
             "source": self.cb_source.currentData(),
-            "thick": self.cb_thick.currentData(),
             "media": self.cb_media.currentData(),
             "quality": self.cb_quality.currentData(),
             "devmode_blob": self.devmode_blob,

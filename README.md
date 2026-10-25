@@ -12,7 +12,7 @@ A fast PDF reader and editor for Windows, built with PyQt6 and PyMuPDF. It looks
 - **Continuous view.** Scroll through all pages like one document. The status bar shows `Page x / n` and the zoom level. Ctrl + mouse wheel zooms; middle-click starts auto-scroll.
 - **Page editing.** Delete, add blank, move, rotate and insert pages from other PDFs, merge PDFs at the end, edit text lines, and undo with Ctrl+Z.
 - **Drag pages out.** Drag thumbnails to a folder or the Desktop to export them as separate PDF or JPG files. Drag thumbnails to reorder.
-- **Full print dialog.** Printer, A0–A5 and custom paper sizes, orientation, scale, page range, pages per sheet, duplex with flip on the long or short edge, paper source (for example the bypass tray), THICK 1/2/3, paper type and print quality for plotters, save-toner and grayscale modes, and a live preview you can drag to reposition the content and zoom with the mouse wheel.
+- **Full print dialog.** Printer, A0–A5 and custom paper sizes, orientation, scale, page range, pages per sheet, duplex with flip on the long or short edge, paper source (auto or the bypass tray), paper type, save-toner and grayscale modes, and a live preview you can drag to reposition the content and zoom with the mouse wheel.
 - **Explorer integration.** Right-click several PDFs or images to combine them, or a single file to open it directly.
 
 ![Print dialog](docs/assets/dark-print.png)
@@ -40,8 +40,8 @@ pyinstaller --noconfirm --onefile --windowed --noupx --exclude-module pymupdf4ll
 
 ## Requirements
 
-Windows 10 or 11, Python 3.10+ when running from source. The print driver features (paper source, THICK, quality) use the Windows print API; the viewer and editor also start on other systems.
+Windows 10 or 11, Python 3.10+ when running from source. The print driver features (paper source, paper type) use the Windows print API; the viewer and editor also start on other systems.
 
 ## Persian summary / خلاصه
 
-PDF Studio یک نرم‌افزار سبک برای خواندن و ویرایش PDF در ویندوز است: هر فایل در یک تب جدا باز می‌شود، صفحه‌ها پشت‌سرهم نمایش داده می‌شوند و می‌توانید صفحه‌ها را حذف، اضافه، جابه‌جا، بچرخانید یا PDF دیگری را وارد کنید. پنجرهٔ چاپ کامل آن شامل انتخاب چاپگر، اندازهٔ کاغذ (A0 تا A5 و دلخواه)، دوطرفه، سینی دستی، حالت THICK و پیش‌نمایش زنده است. ظاهر برنامه شبیه Acrobat است و به‌صورت پیش‌فرض دارک است.
+PDF Studio یک نرم‌افزار سبک برای خواندن و ویرایش PDF در ویندوز است: هر فایل در یک تب جدا باز می‌شود، صفحه‌ها پشت‌سرهم نمایش داده می‌شوند و می‌توانید صفحه‌ها را حذف، اضافه، جابه‌جا، بچرخانید یا PDF دیگری را وارد کنید. پنجرهٔ چاپ کامل آن شامل انتخاب چاپگر، اندازهٔ کاغذ (A0 تا A5 و دلخواه)، دوطرفه، سینی دستی (Bypass)، نوع کاغذ و پیش‌نمایش زنده است. ظاهر برنامه شبیه Acrobat است و به‌صورت پیش‌فرض دارک است.
