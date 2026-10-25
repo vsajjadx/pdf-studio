@@ -1786,10 +1786,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             cb.setFixedWidth(116)
 
         row_printer = QHBoxLayout()
-        self.cb_printer.setMaximumWidth(120)                    # compact printer drop-down
+        self.cb_printer.setMinimumWidth(220)                    # wide printer drop-down; Size / Source / Type sit to its right
         self.cb_printer.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.cb_printer.setMinimumContentsLength(8)
-        row_printer.addWidget(self.cb_printer, 1)
+        row_printer.addWidget(self.cb_printer, 3)
         row_printer.addSpacing(6)
         row_printer.addWidget(QLabel("Size:"))                  # size / source / type sit between printer and Settings
         self.cb_paper.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -1888,7 +1888,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         nav.addWidget(self.bt_prev)
         nav.addWidget(self.lbl_info, 1)
         nav.addWidget(self.bt_next)
-        lbl_hint = QLabel("Drag: move  •  Wheel: zoom  •  Shift+drag: rotate  •  Double-click: reset")
+        lbl_hint = QLabel("Drag: move  •  Wheel: zoom  •  Shift+drag: rotate")
         lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_hint.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
         self.lbl_zoom = QLabel("100%")
