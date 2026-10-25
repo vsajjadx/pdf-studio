@@ -457,7 +457,7 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrinter, QPrinterInfo
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
                              QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect,
-                             QGroupBox, QHBoxLayout,
+                             QGridLayout, QGroupBox, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton, QRadioButton,
                              QScrollArea, QAbstractItemView, QSpinBox, QSplitter,
@@ -1586,15 +1586,21 @@ class RadioChoice(QObject):
     setCurrentIndex / currentIndexChanged), so Adobe-style radio groups can replace dropdowns."""
     currentIndexChanged = pyqtSignal(int)
 
-    def __init__(self, parent=None, horizontal=False):
+    def __init__(self, parent=None, horizontal=False, per_row=0):
         super().__init__(parent)
         self._group = QButtonGroup(self)
         self._buttons, self._data = [], []
         self._horizontal = horizontal
+        self._per_row = per_row                      # >0: lay the radios out in a grid, this many per row
         self.box = QWidget()
-        self.layout_ = QHBoxLayout(self.box) if horizontal else QVBoxLayout(self.box)
+        if per_row:
+            self.layout_ = QGridLayout(self.box)
+            self.layout_.setHorizontalSpacing(14)
+            self.layout_.setVerticalSpacing(6)
+        else:
+            self.layout_ = QHBoxLayout(self.box) if horizontal else QVBoxLayout(self.box)
+            self.layout_.setSpacing(10 if horizontal else 6)
         self.layout_.setContentsMargins(0, 0, 0, 0)
-        self.layout_.setSpacing(10 if horizontal else 6)
         self._group.idToggled.connect(self._toggled)
 
     def addItem(self, text, data, extra=None):
@@ -1603,7 +1609,20 @@ class RadioChoice(QObject):
         self._group.addButton(btn, idx)
         self._buttons.append(btn)
         self._data.append(data)
-        if self._horizontal:
+        if self._per_row:
+            cell = QWidget()
+            lay = QHBoxLayout(cell)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.addWidget(btn)
+            row, col = divmod(idx, self._per_row)
+            if extra is not None:
+                if col + 1 < self._per_row:                               # extra widget takes the next grid cell
+                    self.layout_.addWidget(extra, row, col + 1)
+                else:
+                    lay.addWidget(extra)
+            self.layout_.addWidget(cell, row, col)
+            self.layout_.setColumnStretch(self._per_row, 1)               # spare width goes to the right edge
+        elif self._horizontal:
             self.layout_.addWidget(btn)
             if extra is not None:
                 self.layout_.addWidget(extra)
@@ -1717,17 +1736,16 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.cb_scale.addItem("Custom Scale:", "custom", extra=self.sp_scale)
         self.cb_scale.layout_.addStretch(1)
 
-        self.cb_persheet = QComboBox()
-        for t, v in (("1 page per sheet (normal)", 1), ("2 pages per sheet", 2),
-                     ("4 pages per sheet", 4), ("6 pages per sheet", 6),
-                     ("8 pages per sheet", 8), ("10 pages per sheet", 10),
-                     ("Custom…", "custom")):
-            self.cb_persheet.addItem(t, v)
         self.sp_persheet = QSpinBox()
         self.sp_persheet.setRange(1, 100)
         self.sp_persheet.setValue(9)
-        self.sp_persheet.setSuffix(" / sheet")
+        self.sp_persheet.setSuffix("")
         self.sp_persheet.setVisible(False)
+        self.cb_persheet = RadioChoice(self, horizontal=True, per_row=4)    # 1in1 | 2in1 | 4in1 ... radios
+        for t, v in (("1in1", 1), ("2in1", 2), ("4in1", 4), ("6in1", 6),
+                     ("8in1", 8), ("10in1", 10)):
+            self.cb_persheet.addItem(t, v)
+        self.cb_persheet.addItem("Custom", "custom", extra=self.sp_persheet)
 
         self.rb_all = QRadioButton(f"All pages (1 – {len(doc)})")
         self.rb_cur = QRadioButton(f"Current page ({cur + 1})")
@@ -1823,8 +1841,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         f2 = QFormLayout()
         f2.addRow(self.lbl_custom, self.w_custom)               # only shown for a custom paper size
         row_per = QHBoxLayout()
-        row_per.addWidget(self.cb_persheet, 1)
-        row_per.addWidget(self.sp_persheet)
+        row_per.addWidget(self.cb_persheet.box, 1)
         w_per = QWidget()
         w_per.setLayout(row_per)
         v2 = QVBoxLayout()
