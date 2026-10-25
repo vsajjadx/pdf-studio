@@ -1464,11 +1464,23 @@ class PreviewLabel(QLabel):
     """The preview label itself: click-drag anywhere on it to nudge the printed
     content around the sheet (emits the drag delta, in label pixels)."""
     dragged = pyqtSignal(QPointF)
+    zoomed = pyqtSignal(int)                    # +1 / -1 per wheel notch
+    zoom_reset = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def wheelEvent(self, e):
+        dy = e.angleDelta().y()
+        if dy:
+            self.zoomed.emit(1 if dy > 0 else -1)
+        e.accept()
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.zoom_reset.emit()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -1539,7 +1551,7 @@ class RadioChoice(QObject):
 
 
 class PrintDialog(DarkTitleBarMixin, QDialog):
-    PW, PH = 340, 470                                      # preview size
+    PW, PH = 330, 360                                      # preview size (compact, landscape dialog)
 
     def __init__(self, parent, doc, cur, preset=None, initial_preferences=None):
         super().__init__(parent)
@@ -1549,6 +1561,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self._initial_preferences = initial_preferences or {}
         self.ox_mm, self.oy_mm, self._k = 0.0, 0.0, 1.0     # manual pan offset + last preview scale
         self.image_rotation = 0                               # image rotation, independent of paper orientation
+        self.zoom = 1.0                                       # preview zoom (mouse wheel), 1.0 = fit
         self._printer_options_touched = False
 
         names = QPrinterInfo.availablePrinterNames()
@@ -1661,7 +1674,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             sp.setRange(-200, 200)
             sp.setDecimals(1)
             sp.setSuffix(" mm")
-        self.bt_reset_pos = QPushButton("Reset position")
+        self.bt_reset_pos = QPushButton("Reset view")
         self.bt_reset_pos.clicked.connect(self.reset_offset)
 
         def box(title, form):
@@ -1724,10 +1737,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         row.addWidget(self.rb_range)
         row.addWidget(self.ed_range)
         f3.addLayout(row)
-        f5 = QFormLayout()
-        f5.addRow("Horizontal:", self.sp_ox)
-        f5.addRow("Vertical:", self.sp_oy)
-        f5.addRow(self.bt_reset_pos)
 
         # paper source / THICK / paper type / quality (filled from what the chosen driver reports)
         self.devmode_blob = None                           # settings captured from the driver's own window
@@ -1749,12 +1758,14 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         f6.addRow(self.lbl_media)
         self.grp_media = box("Paper source, type && quality", f6)
 
-        left = QVBoxLayout()
-        left.addWidget(box("Pages to Print", f3))
-        left.addWidget(box("Page Sizing && Handling", v2))
-        left.addWidget(box("Orientation", v_orient))
-        left.addWidget(box("Position on page", f5))
-        left.addStretch(1)
+        left_a = QVBoxLayout()                                 # column 1
+        left_a.addWidget(box("Pages to Print", f3))
+        left_a.addWidget(box("Orientation", v_orient))
+        left_a.addWidget(self.grp_media)                       # takes the old "Position on page" spot
+        left_a.addStretch(1)
+        left_b = QVBoxLayout()                                 # column 2
+        left_b.addWidget(box("Page Sizing && Handling", v2))
+        left_b.addStretch(1)
 
         self.lbl_pv = PreviewLabel()
         self.lbl_pv.setFixedSize(self.PW, self.PH)
@@ -1784,16 +1795,19 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         nav.addWidget(self.bt_prev)
         nav.addWidget(self.lbl_info, 1)
         nav.addWidget(self.bt_next)
-        lbl_hint = QLabel("Drag the preview to reposition the printed content on the page")
+        lbl_hint = QLabel("Drag to move the content  •  Wheel to zoom  •  Double-click to reset zoom")
         lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_hint.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
+        self.lbl_zoom = QLabel("100%")
+        self.lbl_zoom.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
+        rotate_row.insertWidget(0, self.bt_reset_pos)         # reset zoom + position
+        rotate_row.addWidget(self.lbl_zoom)
         right = QVBoxLayout()
         right.addWidget(QLabel("Preview"))
         right.addWidget(self.lbl_pv)
         right.addLayout(rotate_row)
         right.addWidget(lbl_hint)
         right.addLayout(nav)
-        right.addWidget(self.grp_media)
         right.addStretch(1)
 
         self.btn_print = QPushButton("🖨 Print")
@@ -1806,7 +1820,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         bb.rejected.connect(self.reject)
 
         top = QHBoxLayout()
-        top.addLayout(left, 0)
+        top.addLayout(left_a, 0)
+        top.addLayout(left_b, 0)
         top.addLayout(right, 0)
         main = QVBoxLayout(self)
         main.setContentsMargins(18, 14, 18, 16)
@@ -1839,6 +1854,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_ox.valueChanged.connect(self._ox_changed)
         self.sp_oy.valueChanged.connect(self._oy_changed)
         self.lbl_pv.dragged.connect(self.on_drag)
+        self.lbl_pv.zoomed.connect(self._wheel_zoom)
+        self.lbl_pv.zoom_reset.connect(self._reset_zoom)
         self.bt_rotate_left.clicked.connect(lambda: self._rotate_image(-90))
         self.bt_rotate_right.clicked.connect(lambda: self._rotate_image(90))
         self._load_caps()
@@ -2217,7 +2234,17 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.oy_mm = v
         self.update_preview()
 
+    def _wheel_zoom(self, step):
+        z = self.zoom * (1.15 ** step)
+        self.zoom = max(0.5, min(4.0, round(z, 3)))
+        self.update_preview()
+
+    def _reset_zoom(self):
+        self.zoom = 1.0
+        self.update_preview()
+
     def reset_offset(self):
+        self.zoom = 1.0
         self.ox_mm = self.oy_mm = 0.0
         for sp, v in ((self.sp_ox, self.ox_mm), (self.sp_oy, self.oy_mm)):
             sp.blockSignals(True)
@@ -2403,9 +2430,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         duplex = self.duplex_value()
         back = duplex != "none" and self.pv % 2 == 1
         pad = 20 if duplex == "none" else 84                               # extra room for the curl
-        k = min((self.PW - pad) / pw, (self.PH - pad) / ph)                # preview px per point
+        k = min((self.PW - pad) / pw, (self.PH - pad) / ph) * self.zoom    # preview px per point
         self._k = k
-        ox, oy = (self.PW - pw * k) / 2, (self.PH - ph * k) / 2
+        ox, oy = (self.PW - pw * k) / 2, (self.PH - ph * k) / 2             # centred; overflow is clipped
+        self.lbl_zoom.setText(f"{round(self.zoom * 100)}%")
         m = PRINT_MARGIN_MM / 25.4 * 72
         aw, ah = pw - 2 * m, ph - 2 * m
         base_x, base_y = m * k, m * k                                      # relative to the paper's top-left
