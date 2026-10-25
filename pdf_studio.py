@@ -3,7 +3,7 @@ PDF Studio - PDF reader/editor for Windows
   * tabs (like a browser): every opened PDF gets its own tab, in order
   * continuous view (scroll through all pages like one document), page x / n in the status bar
   * drag pages from the preview to export as separate PDF or JPG files
-  * edit text lines, delete / add / move / rotate pages, insert PDFs, undo
+  * edit, move and resize text, images and shapes (Edit mode), delete / add / move / rotate pages, insert PDFs, undo
   * built-in print dialog: printer, A0-A5 + custom size, orientation, scale, page range, duplex,
     paper source (auto / bypass tray), paper type,
     save-toner and grayscale modes, flip on left/right or top/bottom edge, and live preview
@@ -452,14 +452,14 @@ from PyQt6.QtCore import (Qt, QSize, QSizeF, QPoint, QPointF, QRectF, QMarginsF,
                           QMimeData, QObject, QSettings, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDrag, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
                          QPalette, QPixmap, QPainter, QPen, QPainterPath, QPageLayout, QPageSize, QRadialGradient,
-                         QTransform)
+                         QTextCursor, QTransform)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrinter, QPrinterInfo
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
                              QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect,
                              QGridLayout, QGroupBox, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                             QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton, QRadioButton,
+                             QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QRadioButton,
                              QScrollArea, QAbstractItemView, QSpinBox, QSplitter,
                              QStackedWidget, QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
@@ -2640,6 +2640,139 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.lbl_info.setText(info)
 
 
+
+# ============================================================================
+#  OBJECT EDITING HELPERS  (Edit mode: text, images and vector shapes)
+# ============================================================================
+def _rgb_from_int(c):
+    return (((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255)
+
+
+def _redact_flags(images=0, graphics=0, text=1):
+    """Keyword args for Page.apply_redactions that touch only the chosen kind of content."""
+    return dict(images=images, graphics=graphics, text=text)
+
+
+def _apply_redactions(page, images=None, graphics=None, text=None):
+    """Remove only the requested content kinds (older PyMuPDF versions: fall back to the plain call)."""
+    kw = {}
+    kw["images"] = getattr(fitz, "PDF_REDACT_IMAGE_NONE", 0) if images is None else images
+    kw["graphics"] = getattr(fitz, "PDF_REDACT_LINE_ART_NONE", 0) if graphics is None else graphics
+    kw["text"] = getattr(fitz, "PDF_REDACT_TEXT_NONE", 1) if text is None else text
+    try:
+        page.apply_redactions(**kw)
+    except TypeError:
+        page.apply_redactions(images=kw["images"])
+
+
+def _emit_text(page, text, origin, size, flags, color, box=None):
+    """Write one line of text onto the page at `origin` (baseline-left). Latin text uses the standard PDF fonts
+    (matching bold / italic / serif of the original); other scripts (Persian, Arabic ...) are shaped by the HTML engine."""
+    if not text:
+        return
+    size = max(1.0, float(size))
+    if all(ord(ch) < 256 for ch in text):
+        pre = "ti" if flags & 4 else "he"
+        fn = {"ti": {"ro": "tiro", "bo": "tibo", "it": "tiit", "bi": "tibi"},
+              "he": {"lv": "helv", "bo": "hebo", "it": "heit", "bi": "hebi"}}[pre]
+        key = {(0, 0): "ro" if pre == "ti" else "lv", (1, 0): "bo", (0, 1): "it", (1, 1): "bi"}[
+            (1 if flags & 16 else 0, 1 if flags & 2 else 0)]
+        page.insert_text(fitz.Point(origin), text, fontsize=size, fontname=fn[key], color=color)
+        return
+    rtl = bool(re.search(r"[\u0590-\u08FF\uFB50-\uFEFF]", text))
+    fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    css = (f'@font-face{{font-family:ft;src:url("tahoma.ttf");}}'
+           f'*{{font-family:ft;font-size:{size}pt;'
+           f'color:rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)});}}p{{margin:0}}')
+    if box is None:
+        box = fitz.Rect(origin.x, origin.y - size, origin.x + size * max(2, len(text)), origin.y + size * 0.4)
+    box = fitz.Rect(box.x0 - (60 if rtl else 0), box.y0 - 2, box.x1 + (0 if rtl else 60), box.y1 + 2)
+    try:
+        page.insert_htmlbox(box, f'<p dir="{"rtl" if rtl else "ltr"}" style="text-align:'
+                                 f'{"right" if rtl else "left"}">{_html.escape(text)}</p>',
+                            css=css, archive=fitz.Archive(fonts))
+    except Exception:                                       # no Windows fonts (other OS): keep what Latin-1 can show
+        page.insert_text(fitz.Point(origin), text.encode("latin-1", "replace").decode("latin-1"),
+                         fontsize=size, fontname="helv", color=color)
+
+
+def _redraw_path(page, path, T, avg):
+    """Draw a vector path again with every point passed through T (move / scale)."""
+    if not path.get("items"):
+        return
+    sh = page.new_shape()
+    for it in path["items"]:
+        op = it[0]
+        if op == "l":
+            sh.draw_line(T(it[1]), T(it[2]))
+        elif op == "c":
+            sh.draw_bezier(T(it[1]), T(it[2]), T(it[3]), T(it[4]))
+        elif op == "re":
+            a, b = T(it[1].tl), T(it[1].br)
+            sh.draw_rect(fitz.Rect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y)))
+        elif op == "qu":
+            q = it[1]
+            sh.draw_quad(fitz.Quad(T(q.ul), T(q.ur), T(q.ll), T(q.lr)))
+    fill, color = path.get("fill"), path.get("color")
+    if fill is None and color is None:
+        return
+    cap = path.get("lineCap") or (0,)
+    dashes = path.get("dashes")
+    try:
+        sh.finish(fill=fill, color=color, width=max(0.05, (path.get("width") or 1.0) * avg),
+                  dashes=dashes if dashes and dashes.strip() not in ("[] 0", "") else None,
+                  even_odd=bool(path.get("even_odd")), closePath=bool(path.get("closePath")),
+                  lineCap=int(cap[0]) if isinstance(cap, (tuple, list)) else int(cap),
+                  fill_opacity=path.get("fill_opacity") if path.get("fill_opacity") is not None else 1,
+                  stroke_opacity=path.get("stroke_opacity") if path.get("stroke_opacity") is not None else 1)
+        sh.commit()
+    except Exception:
+        pass
+
+
+class InlineTextEditor(QPlainTextEdit):
+    """Small text box that appears on the page while a text object is typed into."""
+    committed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent, text, px_size, width, height):
+        super().__init__(parent)
+        self._done = False
+        f = QFont("Arial")
+        f.setPixelSize(max(8, int(px_size)))
+        self.setFont(f)
+        self.setPlainText(text)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet(f"QPlainTextEdit{{background:rgba(255,255,255,235);color:#111;"
+                           f"border:2px solid {ACCENT};selection-background-color:{ACCENT};}}")
+        self.document().setDocumentMargin(2)
+        self.resize(int(max(width, 60)), int(max(height, px_size * 1.6)))
+        self.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _finish(self, ok):
+        if self._done:
+            return
+        self._done = True
+        if ok:
+            self.committed.emit(self.toPlainText())
+        else:
+            self.cancelled.emit()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self._finish(False)
+            return
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self._finish(True)
+            return
+        super().keyPressEvent(e)
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        self._finish(True)
+
+
 # ============================================================================
 #  DOCUMENT TAB
 # ============================================================================
@@ -2659,8 +2792,29 @@ class PageLabel(QLabel):
         self.setStyleSheet("background:white")
         self.export_drag_enabled = False
         self._press_pos = None
+        self.ctl = None                                     # the DocTab, which owns Edit-mode behaviour
+        self.setMouseTracking(True)
+
+    def _editing(self):
+        return self.ctl is not None and self.ctl.edit_mode
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self._editing():
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self.ctl.paint_overlay(self, p)
+            p.end()
 
     def mousePressEvent(self, e):
+        if self._editing():
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.setFocus()
+                self.ctl.edit_press(self, e.position(), e.modifiers())
+                e.accept()
+            else:
+                e.ignore()
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             self._press_pos = e.position()
             self.clicked.emit(self.index, e.position())
@@ -2668,7 +2822,24 @@ class PageLabel(QLabel):
         else:
             e.ignore()                                      # e.g. middle button -> handled by the scroll area
 
+    def mouseDoubleClickEvent(self, e):
+        if self._editing() and e.button() == Qt.MouseButton.LeftButton:
+            self.ctl.edit_double_click(self, e.position())
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def keyPressEvent(self, e):
+        if self._editing() and self.ctl.edit_key(self, e):
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
     def mouseMoveEvent(self, e):
+        if self._editing():
+            self.ctl.edit_move(self, e.position(), e.buttons(), e.modifiers())
+            e.accept()
+            return
         if (self.export_drag_enabled and self._press_pos is not None
                 and e.buttons() & Qt.MouseButton.LeftButton):
             distance = (e.position().toPoint() - self._press_pos.toPoint()).manhattanLength()
@@ -2680,8 +2851,18 @@ class PageLabel(QLabel):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self._editing():
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.ctl.edit_release(self, e.position(), e.modifiers())
+            e.accept()
+            return
         self._press_pos = None
         super().mouseReleaseEvent(e)
+
+    def leaveEvent(self, e):
+        if self._editing():
+            self.ctl.edit_leave(self)
+        super().leaveEvent(e)
 
 
 class PageCanvas(QWidget):
@@ -3039,6 +3220,9 @@ class DocTab(QWidget):
         self.labels, self.ys, self.hs, self.imgs = [], [], [], {}
         self._armed_export_format = None
         self.edit_mode = False
+        self._objs = {}                                     # page index -> editable objects (text / image / drawing)
+        self.edit_sel, self.edit_page = [], None            # selected objects (all on one page)
+        self._drag, self._ghost, self._hover, self._editor = None, None, None, None
         self._nav, self._pending, self._frac, self._screen_off = False, False, None, None
         self._center_h = False                              # centre the page horizontally after (re)loading
 
@@ -3198,6 +3382,7 @@ class DocTab(QWidget):
             lab.deleteLater()
         self.labels, self.ys, self.hs, self.imgs = [], [], [], {}
         self._frac, self._screen_off = frac, screen_off
+        self._reset_edit_state()
         self.drop_line.hide()
         if not self.doc:
             return
@@ -3207,12 +3392,14 @@ class DocTab(QWidget):
             sizes.append((math.ceil(r.width * self.zoom), math.ceil(r.height * self.zoom)))
         maxw = max(w for w, _ in sizes)
         total_w = maxw + 2 * PAGE_MARGIN
-        cur_cursor = Qt.CursorShape.IBeamCursor if self.edit_mode else Qt.CursorShape.ArrowCursor
+        cur_cursor = Qt.CursorShape.ArrowCursor
         y = PAGE_MARGIN
         for i, (w, h) in enumerate(sizes):
             lab = PageLabel(i, self.container)
             lab.setGeometry((total_w - w) // 2, y, w, h)
             lab.setCursor(cur_cursor)
+            lab.ctl = self
+            lab.setFocusPolicy(Qt.FocusPolicy.StrongFocus if self.edit_mode else Qt.FocusPolicy.NoFocus)
             lab.export_drag_enabled = not self.edit_mode
             lab.setToolTip(f"Drag page {i + 1} to the Desktop to create a separate PDF; "
                            "right-click to choose PDF or JPG. Files remain available for 7 days.")
@@ -3717,74 +3904,492 @@ class DocTab(QWidget):
         p.set_rotation((p.rotation + 90) % 360)
         self.refresh_thumbs()
 
-    # ---------- text editing ----------
+    # ---------- object editing (Edit mode) ----------
+    HANDLE_PX = 8
+
+    def _reset_edit_state(self):
+        self._objs = {}
+        self.edit_sel, self.edit_page = [], None
+        self._drag = self._ghost = self._hover = None
+        if self._editor is not None:
+            ed, self._editor = self._editor, None
+            ed._done = True
+            ed.hide()
+            ed.deleteLater()
+
     def set_edit(self, on):
         self.edit_mode = on
         if on:
             self._clear_armed_export()
-        cur = Qt.CursorShape.IBeamCursor if on else Qt.CursorShape.ArrowCursor
+        else:
+            self._commit_editor()
+            self.edit_sel, self.edit_page, self._drag, self._ghost, self._hover = [], None, None, None, None
         for lab in self.labels:
-            lab.setCursor(cur)
+            lab.setCursor(Qt.CursorShape.ArrowCursor)
             lab.export_drag_enabled = not on
+            lab.setFocusPolicy(Qt.FocusPolicy.StrongFocus if on else Qt.FocusPolicy.NoFocus)
+            lab.update()
 
-    def on_click(self, idx, pos):
-        if not (self.doc and self.edit_mode):
-            return
+    def on_click(self, idx, pos):                           # old click-to-edit-a-line path; Edit mode now handles input itself
+        return
+
+    # -- finding the objects on a page --
+    def page_objects(self, idx):
+        if idx in self._objs:
+            return self._objs[idx]
         page = self.doc[idx]
-        if page.rotation:
-            return QMessageBox.information(self.main, "PDF Studio", "Set the page rotation back to 0° to edit text.")
-        pt = fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom)
-        for b in page.get_text("dict")["blocks"]:
-            if b["type"] != 0:
-                continue
-            for line in b["lines"]:
-                r = fitz.Rect(line["bbox"])
-                if (r + (-1, -1, 1, 1)).contains(pt) and line["spans"]:
-                    return self.edit_line(idx, page, line)
-
-    def edit_line(self, idx, page, line):
-        spans = line["spans"]
-        old = "".join(s["text"] for s in spans)
-        new, ok = QInputDialog.getText(self.main, "Edit text", "Text:", text=old)
-        if not ok or new == old:
-            return
-        s0, rect = spans[0], fitz.Rect(line["bbox"])
-        c = s0["color"]
-        color = (((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255)
-        bg = (1, 1, 1)
-        img = self.imgs.get(idx)
-        if img:                                             # sample background next to the text
-            x = max(0, min(img.width() - 1, int(rect.x0 * self.zoom) - 2))
-            y = max(0, min(img.height() - 1, int(rect.y0 * self.zoom) - 2))
-            q = img.pixelColor(x, y)
-            bg = (q.redF(), q.greenF(), q.blueF())
-        self.snapshot()
+        objs = []
         try:
-            page.add_redact_annot(rect, fill=bg)
-            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-            if all(ord(ch) < 256 for ch in new):
-                f = s0["flags"]
-                pre = "ti" if f & 4 else "he"
-                fn = {"ti": {"ro": "tiro", "bo": "tibo", "it": "tiit", "bi": "tibi"},
-                      "he": {"lv": "helv", "bo": "hebo", "it": "heit", "bi": "hebi"}}[pre]
-                key = {(0, 0): "ro" if pre == "ti" else "lv", (1, 0): "bo", (0, 1): "it", (1, 1): "bi"}[
-                    (1 if f & 16 else 0, 1 if f & 2 else 0)]
-                page.insert_text(fitz.Point(s0["origin"]), new, fontsize=s0["size"], fontname=fn[key], color=color)
-            else:                                           # Persian / Arabic / other scripts (shaped via HTML engine)
-                rtl = bool(re.search(r"[\u0590-\u08FF\uFB50-\uFEFF]", new))
-                fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-                css = (f'@font-face{{font-family:ft;src:url("tahoma.ttf");}}'
-                       f'*{{font-family:ft;font-size:{s0["size"]}pt;'
-                       f'color:rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)});}}p{{margin:0}}')
-                box = fitz.Rect(rect.x0 - (60 if rtl else 0), rect.y0 - 2, rect.x1 + (0 if rtl else 60), rect.y1 + 2)
-                page.insert_htmlbox(box, f'<p dir="{"rtl" if rtl else "ltr"}" style="text-align:'
-                                         f'{"right" if rtl else "left"}">{_html.escape(new)}</p>',
-                                    css=css, archive=fitz.Archive(fonts))
+            for b in page.get_text("dict")["blocks"]:
+                if b.get("type") != 0:
+                    continue
+                lines = [ln for ln in b["lines"] if "".join(sp["text"] for sp in ln["spans"]).strip()]
+                if not lines:
+                    continue
+                r = fitz.Rect(lines[0]["bbox"])
+                for ln in lines[1:]:
+                    r |= fitz.Rect(ln["bbox"])
+                objs.append({"kind": "text", "rect": r, "lines": lines})
+        except Exception:
+            pass
+        try:
+            for im in page.get_image_info(xrefs=True):
+                if im.get("xref") and not (im.get("width", 2) <= 1 and im.get("height", 2) <= 1):   # 1x1 = a deleted image
+                    objs.append({"kind": "image", "rect": fitz.Rect(im["bbox"]), "xref": im["xref"]})
+        except Exception:
+            pass
+        try:
+            paths = [p for p in page.get_drawings() if p.get("type") in ("f", "s", "fs") and p.get("items")]
+            if paths:
+                clusters = page.cluster_drawings(drawings=paths)
+                pr = page.rect
+                for c in clusters:
+                    if c.width * c.height >= 0.85 * pr.width * pr.height:
+                        continue                            # the page background, not an object
+                    mine = [p for p in paths if (fitz.Rect(c) + (-1, -1, 1, 1)).contains(p["rect"])]
+                    if mine:
+                        objs.append({"kind": "draw", "rect": fitz.Rect(c), "paths": mine})
+        except Exception:
+            pass
+        self._objs[idx] = objs
+        return objs
+
+    def _hit(self, idx, pt):
+        tol = 3.0 / self.zoom
+        best, best_area = None, None
+        for o in self.page_objects(idx):
+            if (o["rect"] + (-tol, -tol, tol, tol)).contains(pt):
+                area = max(1.0, o["rect"].width * o["rect"].height) * (0.5 if o["kind"] == "text" else 1.0)
+                if best is None or area < best_area:
+                    best, best_area = o, area
+        return best
+
+    def _sel_rect(self):
+        if not self.edit_sel:
+            return None
+        r = fitz.Rect(self.edit_sel[0]["rect"])
+        for o in self.edit_sel[1:]:
+            r |= o["rect"]
+        return r
+
+    def _handle_points(self, r):
+        cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+        return {"nw": (r.x0, r.y0), "n": (cx, r.y0), "ne": (r.x1, r.y0), "e": (r.x1, cy),
+                "se": (r.x1, r.y1), "s": (cx, r.y1), "sw": (r.x0, r.y1), "w": (r.x0, cy)}
+
+    def _handle_at(self, idx, pos):
+        r = self._sel_rect()
+        if r is None or idx != self.edit_page:
+            return None
+        for name, (hx, hy) in self._handle_points(r).items():
+            if abs(pos.x() - hx * self.zoom) <= self.HANDLE_PX and abs(pos.y() - hy * self.zoom) <= self.HANDLE_PX:
+                return name
+        return None
+
+    _HANDLE_CURSORS = {"nw": Qt.CursorShape.SizeFDiagCursor, "se": Qt.CursorShape.SizeFDiagCursor,
+                       "ne": Qt.CursorShape.SizeBDiagCursor, "sw": Qt.CursorShape.SizeBDiagCursor,
+                       "n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
+                       "e": Qt.CursorShape.SizeHorCursor, "w": Qt.CursorShape.SizeHorCursor}
+
+    def _page_ok(self, idx):
+        if self.doc[idx].rotation:
+            QMessageBox.information(self.main, "PDF Studio", "Set the page rotation back to 0° to edit this page.")
+            return False
+        return True
+
+    # -- mouse --
+    def edit_press(self, lab, pos, mods):
+        idx = lab.index
+        self._commit_editor()
+        if not self._page_ok(idx):
+            return
+        pt = fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom)
+        h = self._handle_at(idx, pos)
+        if h:
+            r = self._sel_rect()
+            hp = self._handle_points(r)
+            opp = {"nw": "se", "n": "s", "ne": "sw", "e": "w", "se": "nw", "s": "n", "sw": "ne", "w": "e"}[h]
+            ax, ay = hp[opp]
+            self._drag = {"mode": "resize", "handle": h, "anchor": (ax, ay), "hpos": hp[h], "rect": fitz.Rect(r), "idx": idx}
+            self._ghost = (1.0, 1.0, 0.0, 0.0)
+            return
+        o = self._hit(idx, pt)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if o is not None:
+            if idx != self.edit_page:
+                self.edit_sel = []
+            self.edit_page = idx
+            if shift:
+                self.edit_sel = [x for x in self.edit_sel if x is not o] if o in self.edit_sel else self.edit_sel + [o]
+            elif o not in self.edit_sel:
+                self.edit_sel = [o]
+            self._drag = {"mode": "move", "start": pos, "idx": idx, "moved": False}
+            self._ghost = (1.0, 1.0, 0.0, 0.0)
+        else:
+            if not shift:
+                self.edit_sel = []
+            self.edit_page = idx
+            self._drag = {"mode": "band", "start": pos, "idx": idx}
+            self._band = QRectF(pos, pos)
+        for l in self.labels:
+            l.update()
+
+    def edit_move(self, lab, pos, buttons, mods):
+        idx = lab.index
+        d = self._drag
+        if d is None or not (buttons & Qt.MouseButton.LeftButton) or d["idx"] != idx:
+            if d is None:                                   # hover feedback
+                h = self._handle_at(idx, pos)
+                if h:
+                    lab.setCursor(self._HANDLE_CURSORS[h])
+                    return
+                o = self._hit(idx, fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom))
+                if o is not self._hover:
+                    self._hover = o
+                    lab.update()
+                if o is not None:
+                    lab.setCursor(Qt.CursorShape.SizeAllCursor if o in self.edit_sel
+                                  else Qt.CursorShape.PointingHandCursor)
+                else:
+                    lab.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        if d["mode"] == "move":
+            dx, dy = (pos.x() - d["start"].x()) / self.zoom, (pos.y() - d["start"].y()) / self.zoom
+            if not d["moved"] and math.hypot(dx, dy) * self.zoom < 3:
+                return
+            d["moved"] = True
+            if mods & Qt.KeyboardModifier.ShiftModifier:    # Shift: keep to one axis
+                if abs(dx) > abs(dy):
+                    dy = 0
+                else:
+                    dx = 0
+            self._ghost = (1.0, 1.0, dx, dy)
+        elif d["mode"] == "resize":
+            h, r = d["handle"], d["rect"]
+            ax, ay = d["anchor"]
+            mx, my = pos.x() / self.zoom, pos.y() / self.zoom
+            w0, h0 = max(1e-3, r.width), max(1e-3, r.height)
+            has_text = any(o["kind"] == "text" for o in self.edit_sel)
+            hx, hy = d["hpos"]
+            sx = (mx - ax) / (hx - ax) if ("e" in h or "w" in h) and abs(hx - ax) > 1e-6 else 1.0
+            sy = (my - ay) / (hy - ay) if ("n" in h or "s" in h) and abs(hy - ay) > 1e-6 else 1.0
+            if len(h) == 2:                                 # corners keep the proportions
+                sx = sy = max(0.05, max(sx, sy))
+            elif has_text:                                  # text only scales evenly
+                sx = sy = max(0.05, sx if h in ("e", "w") else sy)
+            else:
+                sx, sy = max(0.05, sx), max(0.05, sy)
+            self._ghost = (sx, sy, 0.0, 0.0)
+        elif d["mode"] == "band":
+            self._band = QRectF(d["start"], pos).normalized()
+        lab.update()
+
+    def edit_release(self, lab, pos, mods):
+        d, self._drag = self._drag, None
+        g, self._ghost = self._ghost, None
+        if d is None:
+            return
+        idx = d["idx"]
+        if d["mode"] == "band":
+            b = self._band
+            self._band = None
+            if b.width() > 3 or b.height() > 3:
+                rect = fitz.Rect(b.left() / self.zoom, b.top() / self.zoom, b.right() / self.zoom, b.bottom() / self.zoom)
+                add = [o for o in self.page_objects(idx) if rect.contains(o["rect"]) and o not in self.edit_sel]
+                self.edit_sel = self.edit_sel + add if (mods & Qt.KeyboardModifier.ShiftModifier) else add
+        elif g is not None and (abs(g[0] - 1) > 1e-4 or abs(g[1] - 1) > 1e-4 or abs(g[2]) > 1e-4 or abs(g[3]) > 1e-4):
+            if d["mode"] == "resize":
+                self._apply_transform(idx, d["anchor"], g[0], g[1], 0.0, 0.0)
+            else:
+                self._apply_transform(idx, (0.0, 0.0), 1.0, 1.0, g[2], g[3])
+        lab.update()
+
+    def edit_leave(self, lab):
+        if self._hover is not None:
+            self._hover = None
+            lab.update()
+
+    def edit_double_click(self, lab, pos):
+        idx = lab.index
+        if not self._page_ok(idx):
+            return
+        pt = fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom)
+        o = self._hit(idx, pt)
+        if o is not None and o["kind"] == "text":
+            self.edit_page, self.edit_sel = idx, [o]
+            self._open_editor(lab, o)
+        elif o is None:
+            self.edit_page, self.edit_sel = idx, []
+            self._open_editor(lab, None, pt)
+        lab.update()
+
+    def edit_key(self, lab, e):
+        k = e.key()
+        if self._editor is not None:
+            return False
+        if k == Qt.Key.Key_Escape:
+            self.edit_sel = []
+            lab.update()
+            return True
+        if not self.edit_sel or lab.index != self.edit_page:
+            return False
+        if k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._apply_delete(lab.index)
+            return True
+        if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_F2):
+            o = self.edit_sel[0]
+            if len(self.edit_sel) == 1 and o["kind"] == "text":
+                self._open_editor(lab, o)
+            return True
+        step = 10.0 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1.0
+        dxy = {Qt.Key.Key_Left: (-step, 0), Qt.Key.Key_Right: (step, 0),
+               Qt.Key.Key_Up: (0, -step), Qt.Key.Key_Down: (0, step)}.get(k)
+        if dxy:
+            self._apply_transform(lab.index, (0.0, 0.0), 1.0, 1.0, dxy[0], dxy[1])
+            return True
+        return False
+
+    # -- drawing the selection --
+    def _tx_rect(self, r, g, anchor):
+        sx, sy, dx, dy = g
+        ax, ay = anchor
+        return fitz.Rect(ax + (r.x0 - ax) * sx + dx, ay + (r.y0 - ay) * sy + dy,
+                         ax + (r.x1 - ax) * sx + dx, ay + (r.y1 - ay) * sy + dy)
+
+    def paint_overlay(self, lab, p):
+        idx, z = lab.index, self.zoom
+        accent = QColor(ACCENT)
+        if self._hover is not None and self._hover in self.page_objects(idx) and self._hover not in self.edit_sel and self._drag is None:
+            r = self._hover["rect"]
+            p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 150), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(QRectF(r.x0 * z, r.y0 * z, r.width * z, r.height * z))
+        if idx == self.edit_page and self._band is not None and self._drag and self._drag["mode"] == "band":
+            p.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
+            p.setBrush(QColor(accent.red(), accent.green(), accent.blue(), 30))
+            p.drawRect(self._band)
+        if idx != self.edit_page or not self.edit_sel:
+            return
+        g = self._ghost or (1.0, 1.0, 0.0, 0.0)
+        anchor = self._drag["anchor"] if (self._drag and self._drag["mode"] == "resize") else (0.0, 0.0)
+        img = self.imgs.get(idx)
+        moving = self._ghost is not None and g != (1.0, 1.0, 0.0, 0.0)
+        for o in self.edit_sel:
+            r0 = o["rect"]
+            r = self._tx_rect(r0, g, anchor)
+            tgt = QRectF(r.x0 * z, r.y0 * z, r.width * z, r.height * z)
+            if moving and img is not None:                  # live ghost of the content being moved / scaled
+                p.setOpacity(0.8)
+                p.drawImage(tgt, img, QRectF(r0.x0 * z, r0.y0 * z, r0.width * z, r0.height * z))
+                p.setOpacity(1.0)
+            p.setPen(QPen(accent, 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(tgt)
+        r = self._tx_rect(self._sel_rect(), g, anchor)
+        p.setPen(QPen(accent, 1.4))
+        p.setBrush(QColor("white"))
+        hs = self.HANDLE_PX - 2
+        for hx, hy in self._handle_points(r).values():
+            p.drawRect(QRectF(hx * z - hs / 2, hy * z - hs / 2, hs, hs))
+
+    _band = None
+
+    # -- inline text editor --
+    def _open_editor(self, lab, obj, pt=None):
+        self._commit_editor()
+        z = self.zoom
+        if obj is not None:
+            lines = obj["lines"]
+            text = "\n".join("".join(sp["text"] for sp in ln["spans"]) for ln in lines)
+            size = lines[0]["spans"][0]["size"]
+            r = obj["rect"]
+            x, y, w, h = r.x0 * z - 2, r.y0 * z - 2, r.width * z + 60, r.height * z + 6
+        else:
+            text, size = "", 12.0
+            x, y, w, h = pt.x * z, (pt.y - size) * z, 220, size * z * 1.8
+        ed = InlineTextEditor(lab, text, size * z, w, h)
+        ed.move(int(x), int(y))
+        ed.committed.connect(lambda t, o=obj, p0=pt, i=lab.index: self._editor_done(i, o, p0, t))
+        ed.cancelled.connect(lambda: self._editor_closed())
+        self._editor = ed
+        ed.show()
+        ed.setFocus()
+        if text:
+            ed.selectAll()
+
+    def _commit_editor(self):
+        ed = self._editor
+        if ed is not None:
+            ed._finish(True)
+
+    def _editor_closed(self):
+        ed, self._editor = self._editor, None
+        if ed is not None:
+            ed.hide()
+            ed.deleteLater()
+
+    def _editor_done(self, idx, obj, pt, text):
+        self._editor_closed()
+        try:
+            if obj is None:
+                if text.strip():
+                    self._apply_new_text(idx, pt, text)
+            else:
+                old = "\n".join("".join(sp["text"] for sp in ln["spans"]) for ln in obj["lines"])
+                if text != old:
+                    self._apply_text_edit(idx, obj, text)
         except Exception as e:
             QMessageBox.warning(self.main, "Edit failed", str(e))
-        # only redraw the edited page + its thumbnail (keeps the scroll position)
+
+    # -- applying changes to the PDF --
+    def _finish_edit(self, idx, select_rects=None):
+        """Redraw the changed page + its thumbnail (keeps the scroll position) and re-select what was edited."""
+        self._objs.pop(idx, None)
         self.render_page(idx, force=True)
         self.thumbs.item(idx).setIcon(self.thumb_icon(idx))
+        self.edit_page = idx
+        self.edit_sel = []
+        if select_rects:
+            for o in self.page_objects(idx):
+                for rr in select_rects:
+                    if (abs(o["rect"].x0 - rr.x0) < 4 and abs(o["rect"].y0 - rr.y0) < 4
+                            and abs(o["rect"].x1 - rr.x1) < 6 and abs(o["rect"].y1 - rr.y1) < 6):
+                        self.edit_sel.append(o)
+                        break
+        self.labels[idx].update()
+
+    def _remove_objects(self, page, objs):
+        """Take the objects off the page (text, images and vector shapes each in their own pass)."""
+        texts = [o for o in objs if o["kind"] == "text"]
+        for o in texts:
+            page.add_redact_annot(o["rect"] + (0.3, 0.3, -0.3, -0.3), fill=False)
+        if texts:
+            _apply_redactions(page, text=getattr(fitz, "PDF_REDACT_TEXT_REMOVE", 0))
+        for o in objs:
+            if o["kind"] == "image":
+                try:
+                    page.delete_image(o["xref"])
+                except Exception:
+                    page.add_redact_annot(o["rect"], fill=False)
+                    _apply_redactions(page, images=getattr(fitz, "PDF_REDACT_IMAGE_REMOVE", 1))
+        draws = [o for o in objs if o["kind"] == "draw"]
+        for o in draws:
+            page.add_redact_annot(o["rect"] + (0.4, 0.4, -0.4, -0.4), fill=False)
+        if draws:                                           # "if touched": curves (circles ...) are not removed by "if covered"
+            _apply_redactions(page, graphics=getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED", 2))
+
+    def _image_payload(self, o):
+        info = self.doc.extract_image(o["xref"])
+        if not info:
+            return None
+        mask = None
+        if info.get("smask"):
+            try:
+                mask = fitz.Pixmap(self.doc, info["smask"]).tobytes("png")
+            except Exception:
+                mask = None
+        return info["image"], mask
+
+    def _apply_transform(self, idx, anchor, sx, sy, dx, dy):
+        objs = list(self.edit_sel)
+        if not objs:
+            return
+        ax, ay = anchor
+        T = lambda p: fitz.Point(ax + (p.x - ax) * sx + dx, ay + (p.y - ay) * sy + dy)
+        if abs(sx - 1) < 1e-6:
+            s_text = sy
+        elif abs(sy - 1) < 1e-6:
+            s_text = sx
+        else:
+            s_text = (sx + sy) / 2
+        avg = (abs(sx) + abs(sy)) / 2
+        page = self.doc[idx]
+        self.snapshot()
+        new_rects = [self._tx_rect(o["rect"], (sx, sy, dx, dy), anchor) for o in objs]
+        try:
+            payloads = {o["xref"]: self._image_payload(o) for o in objs if o["kind"] == "image"}
+            self._remove_objects(page, objs)
+            for o, nr in zip(objs, new_rects):
+                if o["kind"] == "text":
+                    for ln in o["lines"]:
+                        for sp in ln["spans"]:
+                            if not sp["text"].strip():
+                                continue
+                            bb = fitz.Rect(sp["bbox"])
+                            nb = fitz.Rect(T(bb.tl), T(bb.br))
+                            _emit_text(page, sp["text"], T(fitz.Point(sp["origin"])), sp["size"] * s_text,
+                                       sp["flags"], _rgb_from_int(sp["color"]), nb)
+                elif o["kind"] == "image":
+                    pl = payloads.get(o["xref"])
+                    if pl:
+                        page.insert_image(nr, stream=pl[0], mask=pl[1], keep_proportion=False)
+                else:
+                    for path in o["paths"]:
+                        _redraw_path(page, path, T, avg)
+        except Exception as e:
+            QMessageBox.warning(self.main, "Edit failed", str(e))
+        self._finish_edit(idx, new_rects)
+
+    def _apply_delete(self, idx):
+        objs = list(self.edit_sel)
+        if not objs:
+            return
+        self.snapshot()
+        try:
+            self._remove_objects(self.doc[idx], objs)
+        except Exception as e:
+            QMessageBox.warning(self.main, "Edit failed", str(e))
+        self._finish_edit(idx)
+
+    def _apply_text_edit(self, idx, obj, text):
+        page = self.doc[idx]
+        self.snapshot()
+        lines = obj["lines"]
+        sp0 = lines[0]["spans"][0]
+        size, flags, color = sp0["size"], sp0["flags"], _rgb_from_int(sp0["color"])
+        ox, oy = sp0["origin"]
+        step = (lines[1]["spans"][0]["origin"][1] - oy) if len(lines) > 1 else size * 1.2
+        if step <= 0:
+            step = size * 1.2
+        r = obj["rect"]
+        self._remove_objects(page, [obj])
+        new_rects = []
+        for i, t in enumerate(text.split("\n")):
+            if t.strip():
+                y = oy + i * step
+                _emit_text(page, t, fitz.Point(ox, y), size, flags, color,
+                           fitz.Rect(r.x0, y - size, r.x1, y + size * 0.4))
+        self._finish_edit(idx)
+
+    def _apply_new_text(self, idx, pt, text):
+        page = self.doc[idx]
+        self.snapshot()
+        size = 12.0
+        for i, t in enumerate(text.split("\n")):
+            if t.strip():
+                y = pt.y + i * size * 1.2
+                _emit_text(page, t, fitz.Point(pt.x, y), size, 0, (0, 0, 0))
+        self._finish_edit(idx)
 
 
 # ============================================================================
