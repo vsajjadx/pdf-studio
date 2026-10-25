@@ -2983,18 +2983,48 @@ class ThumbList(QListWidget):
 
 
 class DelButton(QPushButton):
-    """Small round x on a page thumbnail: deletes exactly that page."""
+    """Small trash-can button in the top-left corner of a page thumbnail: deletes exactly that page."""
     def __init__(self, index, parent):
-        super().__init__("✕", parent)
+        super().__init__("", parent)
         self.index = index
-        self.setFixedSize(22, 22)
+        self.setFixedSize(24, 24)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setToolTip(f"Delete page {index + 1}  (Ctrl+Z to undo)")
-        self.setStyleSheet(f"QPushButton{{background:{T['SURFACE']};color:{T['TEXT2']};"
-                           f"border:1px solid {T['LINE2']};border-radius:11px;padding:0;"
-                           "font-size:11px;font-weight:bold}"
-                           "QPushButton:hover{background:#D7373F;border-color:#D7373F;color:white}")
+        self.setStyleSheet("QPushButton{border:none;background:transparent}")
+
+    def paintEvent(self, e):
+        hot = self.underMouse()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QPen(QColor("#D7373F" if hot else T["LINE2"]), 1))
+        p.setBrush(QColor("#D7373F") if hot else QColor(T["SURFACE"]))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 6, 6)
+        col = QColor("white") if hot else QColor(T["TEXT2"])
+        p.setPen(QPen(col, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.translate(self.width() / 2, self.height() / 2)
+        p.drawLine(QPointF(-5.5, -4.5), QPointF(5.5, -4.5))                  # lid
+        p.drawLine(QPointF(-1.8, -4.5), QPointF(-1.8, -6.2))                 # handle
+        p.drawLine(QPointF(1.8, -4.5), QPointF(1.8, -6.2))
+        p.drawLine(QPointF(-1.8, -6.2), QPointF(1.8, -6.2))
+        body = QPainterPath()                                                # bin body, slightly tapered
+        body.moveTo(-4.2, -2.6)
+        body.lineTo(-3.5, 5.6)
+        body.lineTo(3.5, 5.6)
+        body.lineTo(4.2, -2.6)
+        p.drawPath(body)
+        p.drawLine(QPointF(-1.5, -0.4), QPointF(-1.5, 3.4))                  # ribs
+        p.drawLine(QPointF(1.5, -0.4), QPointF(1.5, 3.4))
+        p.end()
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
 
 
 class DocTab(QWidget):
@@ -3200,7 +3230,7 @@ class DocTab(QWidget):
         self.changed.emit()
 
     def place_del_buttons(self):
-        """Each x sits in the top-right corner of its page thumbnail."""
+        """Each trash button sits in the top-left corner of its page thumbnail."""
         vp = self.thumbs.viewport()
         for i, b in enumerate(self.del_btns):
             it = self.thumbs.item(i)
@@ -3211,7 +3241,7 @@ class DocTab(QWidget):
             if r.bottom() < 0 or r.top() > vp.height():
                 b.hide()
                 continue
-            b.move(r.right() - b.width() - 6, r.top() + 6)
+            b.move(r.left() + 7, r.top() + 12)                 # inside the thumbnail, top-left corner
             b.show()
             b.raise_()
 
