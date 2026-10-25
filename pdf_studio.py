@@ -9,7 +9,7 @@ PDF Studio - PDF reader/editor for Windows
     save-toner and grayscale modes, flip on left/right or top/bottom edge, and live preview
   * Explorer right-click: combine multiple PDFs/images, or open a single selection directly
   * single window: opening another PDF while the app is running adds a new tab
-  * Acrobat-style look, dark by default (start with --light for the light theme): document tabs above
+  * Acrobat-style look, light by default (start with --dark for the dark theme): document tabs above
     the toolbar, thumbnail panel on the left, grey page canvas, blue pill buttons, red app mark
 
 Requirements:   pip install pymupdf PyQt6
@@ -609,8 +609,8 @@ _THEMES = {
         ACC="#1473E6", ACC_HOVER="#0D66D0", ACC_PRESS="#095ABA", DRAG="#1473E6",
         RIM=(0, 0, 0, 60), THUMB_RIM=(0, 0, 0, 70), DARK=False),
 }
-# dark is the default; start with  python pdf_studio.py --light  for the light Acrobat look
-T = _THEMES["light" if "--light" in sys.argv else "dark"]
+# light is the default; start with  python pdf_studio.py --dark  for the dark theme
+T = _THEMES["dark" if "--dark" in sys.argv else "light"]
 ACCENT = T["DRAG"]             # drop lines / auto-scroll mark
 
 
@@ -808,7 +808,7 @@ def _theme_palette():
 
 
 def apply_theme(app):
-    """Fusion style + palette + Acrobat-style stylesheet (dark by default) for the whole application."""
+    """Fusion style + palette + Acrobat-style stylesheet (light by default) for the whole application."""
     app.setStyle("Fusion")
     app.setPalette(_theme_palette())
     f = QFont()
