@@ -216,7 +216,7 @@ def _fast_forward(paths):
             pipe = "\\\\.\\pipe\\" + SERVER_NAME                          # where Qt's QLocalServer listens
             for _ in range(20):
                 try:
-                    with open(pipe, "wb", buffering=0) as f:
+                    with open(pipe, "r+b", buffering=0) as f:        # r+b = OPEN_EXISTING (no create/truncate)
                         f.write(data)
                     return True
                 except FileNotFoundError:
@@ -3882,15 +3882,21 @@ class Main(DarkTitleBarMixin, QMainWindow):
     def _on_connection(self):
         sock = self.server.nextPendingConnection()
         buf = bytearray()
+        finished = []
         sock.readyRead.connect(lambda: buf.extend(bytes(sock.readAll())))
 
         def done():
+            if finished:                                    # disconnected() and the state check can both fire
+                return
+            finished.append(True)
             buf.extend(bytes(sock.readAll()))
             paths = [l for l in buf.decode("utf-8", "ignore").splitlines() if l.strip()]
             self.open_paths(paths)
             self.bring_to_front()
             sock.deleteLater()
         sock.disconnected.connect(done)
+        if sock.state() == QLocalSocket.LocalSocketState.UnconnectedState:
+            QTimer.singleShot(0, done)                      # the sender was already gone: handle what it wrote
 
     # ---------- UI ----------
     def _act(self, text, slot, key=None, checkable=False):
