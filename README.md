@@ -1,6 +1,6 @@
 # PDF Studio
 
-A fast PDF reader and editor for Windows, built with PyQt6 and PyMuPDF. It looks and feels like Acrobat (light by default, dark with `--dark`) and keeps everything in one window.
+A fast PDF reader and editor for Windows, built with PyQt6 and PyMuPDF. It looks and feels like Acrobat (dark grey by default, light with `--light`) and keeps everything in one window.
 
 ![PDF Studio, dark theme](docs/assets/dark-viewer.png)
 
@@ -22,7 +22,7 @@ A fast PDF reader and editor for Windows, built with PyQt6 and PyMuPDF. It looks
 ```
 pip install -r requirements.txt
 python pdf_studio.py [file.pdf ...]
-python pdf_studio.py --dark         # dark theme
+python pdf_studio.py --light        # light theme
 ```
 
 Add the Explorer right-click menu with `python pdf_studio.py --install` (remove it with `--uninstall`), then pick PDF Studio under Settings → Apps → Default apps if you want it as your default PDF app.

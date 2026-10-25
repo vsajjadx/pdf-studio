@@ -9,7 +9,7 @@ PDF Studio - PDF reader/editor for Windows
     save-toner and grayscale modes, flip on left/right or top/bottom edge, and live preview
   * Explorer right-click: combine multiple PDFs/images, or open a single selection directly
   * single window: opening another PDF while the app is running adds a new tab
-  * Acrobat-style look, light by default (start with --dark for the dark theme): document tabs above
+  * Acrobat-style look, dark grey by default (start with --light for the light theme): document tabs above
     the toolbar, thumbnail panel on the left, grey page canvas, blue pill buttons, red app mark
 
 Requirements:   pip install pymupdf PyQt6
@@ -585,18 +585,18 @@ def _icon_ref():
 # ============================================================================
 _THEMES = {
     "dark": dict(
-        BG="#2B2B2B", SURFACE="#323232", STRIP="#1F1F1F", CANVAS="#262626", PANEL="#2B2B2B",
-        LINE="#444444", LINE2="#5A5A5A", HOVER="#3E3E3E", PRESS="#4A4A4A", SEL="#24456E", SEL_TEXT="#9CC7FF",
+        BG="#3C3C3C", SURFACE="#444444", STRIP="#303030", CANVAS="#353535", PANEL="#3C3C3C",
+        LINE="#565656", LINE2="#6A6A6A", HOVER="#505050", PRESS="#5C5C5C", SEL="#24456E", SEL_TEXT="#9CC7FF",
         TEXT="#E6E6E6", TEXT2="#BDBDBD", MUTED="#9A9A9A", DISABLED="#6A6A6A", TITLE="#FFFFFF",
-        FIELD="#1E1E1E", FIELD_BORDER="#6B6B6B", FIELD_BORDER_H="#A0A0A0",
-        BTN_BG="#323232", BTN_BORDER="#8A8A8A", BTN_BORDER_H="#E6E6E6", BTN_HOVER="#3E3E3E", BTN_PRESS="#4A4A4A",
-        DIS_BG="#2B2B2B", DIS_BORDER="#444444", PRIM_DIS_BG="#3A3A3A", TAB_HOVER="#2C2C2C",
-        SB_TRACK="#2B2B2B", SB_HANDLE="#5A5A5A", SB_HANDLE_H="#7C7C7C", CLOSE_HOVER="#4A4A4A", CHIP="#3A3A3A",
-        SELECTION="#2F5C9E", TRACK="#444444", TIP_BG="#3A3A3A", TIP_BORDER="#5A5A5A", MENU_SEL_TEXT="#FFFFFF",
+        FIELD="#333333", FIELD_BORDER="#7A7A7A", FIELD_BORDER_H="#B0B0B0",
+        BTN_BG="#444444", BTN_BORDER="#8E8E8E", BTN_BORDER_H="#E6E6E6", BTN_HOVER="#505050", BTN_PRESS="#5C5C5C",
+        DIS_BG="#3C3C3C", DIS_BORDER="#565656", PRIM_DIS_BG="#4C4C4C", TAB_HOVER="#3A3A3A",
+        SB_TRACK="#3C3C3C", SB_HANDLE="#6A6A6A", SB_HANDLE_H="#8A8A8A", CLOSE_HOVER="#5C5C5C", CHIP="#4C4C4C",
+        SELECTION="#2F5C9E", TRACK="#565656", TIP_BG="#4C4C4C", TIP_BORDER="#6A6A6A", MENU_SEL_TEXT="#FFFFFF",
         CHECK_COL="#E6E6E6", ARROW="#CFCFCF",
         ACC="#2680EB", ACC_HOVER="#4B9CF5", ACC_PRESS="#1473E6", DRAG="#378EF0",
-        BODY="#262626", BODY_PANEL="#2B2B2B", BODY_TEXT="#BDBDBD", BODY_HOVER="#3E3E3E",
-        BODY_SB_TRACK="#2B2B2B", BODY_SB_HANDLE="#5A5A5A", BODY_SB_HANDLE_H="#7C7C7C",
+        BODY="#4A4A4A", BODY_PANEL="#3B3B3B", BODY_TEXT="#BDBDBD", BODY_HOVER="#505050",
+        BODY_SB_TRACK="#3B3B3B", BODY_SB_HANDLE="#6E6E6E", BODY_SB_HANDLE_H="#8C8C8C",
         RIM=(255, 255, 255, 38), THUMB_RIM=(255, 255, 255, 70), DARK=True),
     "light": dict(
         BG="#F4F4F4", SURFACE="#FFFFFF", STRIP="#EBEBEB", CANVAS="#E4E4E4", PANEL="#F4F4F4",
@@ -613,8 +613,8 @@ _THEMES = {
         BODY_SB_TRACK="#3B3B3B", BODY_SB_HANDLE="#6E6E6E", BODY_SB_HANDLE_H="#8C8C8C",
         RIM=(0, 0, 0, 60), THUMB_RIM=(0, 0, 0, 70), DARK=False),
 }
-# light is the default; start with  python pdf_studio.py --dark  for the dark theme
-T = _THEMES["dark" if "--dark" in sys.argv else "light"]
+# dark grey is the default; start with  python pdf_studio.py --light  for the light theme
+T = _THEMES["light" if "--light" in sys.argv else "dark"]
 ACCENT = T["DRAG"]             # drop lines / auto-scroll mark
 
 
@@ -821,7 +821,7 @@ def _theme_palette():
 
 
 def apply_theme(app):
-    """Fusion style + palette + Acrobat-style stylesheet (light by default) for the whole application."""
+    """Fusion style + palette + Acrobat-style stylesheet (dark grey by default) for the whole application."""
     app.setStyle("Fusion")
     app.setPalette(_theme_palette())
     f = QFont()
