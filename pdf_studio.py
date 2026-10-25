@@ -1594,9 +1594,8 @@ class RadioChoice(QObject):
         self._per_row = per_row                      # >0: lay the radios out in a grid, this many per row
         self.box = QWidget()
         if per_row:
-            self.layout_ = QGridLayout(self.box)
-            self.layout_.setHorizontalSpacing(14)
-            self.layout_.setVerticalSpacing(6)
+            self.layout_ = QVBoxLayout(self.box)
+            self.layout_.setSpacing(6)
         else:
             self.layout_ = QHBoxLayout(self.box) if horizontal else QVBoxLayout(self.box)
             self.layout_.setSpacing(10 if horizontal else 6)
@@ -1610,18 +1609,18 @@ class RadioChoice(QObject):
         self._buttons.append(btn)
         self._data.append(data)
         if self._per_row:
-            cell = QWidget()
-            lay = QHBoxLayout(cell)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.addWidget(btn)
             row, col = divmod(idx, self._per_row)
+            while self.layout_.count() <= row:                            # a new row: radios packed to the left
+                rl = QHBoxLayout()
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(6)
+                rl.addStretch(1)
+                self.layout_.addLayout(rl)
+            rl = self.layout_.itemAt(row).layout()
+            btn.setMinimumWidth(66)                                       # equal columns without a grid
+            rl.insertWidget(rl.count() - 1, btn)
             if extra is not None:
-                if col + 1 < self._per_row:                               # extra widget takes the next grid cell
-                    self.layout_.addWidget(extra, row, col + 1)
-                else:
-                    lay.addWidget(extra)
-            self.layout_.addWidget(cell, row, col)
-            self.layout_.setColumnStretch(self._per_row, 1)               # spare width goes to the right edge
+                rl.insertWidget(rl.count() - 1, extra)
         elif self._horizontal:
             self.layout_.addWidget(btn)
             if extra is not None:
