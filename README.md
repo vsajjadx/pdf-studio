@@ -12,7 +12,7 @@ A fast PDF reader and editor for Windows, built with PyQt6 and PyMuPDF. It looks
 - **Continuous view.** Scroll through all pages like one document. The status bar shows `Page x / n` and the zoom level. Ctrl + mouse wheel zooms; middle-click starts auto-scroll.
 - **Page editing.** Delete, add blank, move, rotate and insert pages from other PDFs, merge PDFs at the end, edit text lines, and undo with Ctrl+Z.
 - **Drag pages out.** Drag thumbnails to a folder or the Desktop to export them as separate PDF or JPG files. Drag thumbnails to reorder.
-- **Full print dialog.** Printer, A0–A5 and custom paper sizes, orientation, scale, page range, pages per sheet, duplex with flip on the long or short edge, paper source (for example the bypass tray), THICK 1/2/3, paper type and print quality for plotters, save-toner and grayscale modes, and a live preview you can drag to reposition the content.
+- **Full print dialog.** Printer, A0–A5 and custom paper sizes, orientation, scale, page range, pages per sheet, duplex with flip on the long or short edge, paper source (for example the bypass tray), THICK 1/2/3, paper type and print quality for plotters, save-toner and grayscale modes, and a live preview you can drag to reposition the content and zoom with the mouse wheel.
 - **Explorer integration.** Right-click several PDFs or images to combine them, or a single file to open it directly.
 
 ![Print dialog](docs/assets/dark-print.png)
