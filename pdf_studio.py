@@ -1556,7 +1556,7 @@ class RadioChoice(QObject):
 
 
 class PrintDialog(DarkTitleBarMixin, QDialog):
-    PW, PH = 290, 300                                      # preview size (compact, landscape dialog)
+    PW, PH = 300, 300                                      # preview size (compact, landscape dialog)
 
     def __init__(self, parent, doc, cur, preset=None, initial_preferences=None):
         super().__init__(parent)
@@ -1614,9 +1614,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         rc.addWidget(self.sp_ph)
         self.lbl_custom.setVisible(False)
         self.w_custom.setVisible(False)
-        self.cb_orient = RadioChoice(self)                     # Adobe: radio buttons, not a dropdown
+        self.cb_orient = RadioChoice(self, horizontal=True)    # Adobe: radio buttons, not a dropdown
         for t, v in (("Auto portrait/landscape", "auto"), ("Portrait", "p"), ("Landscape", "l")):
             self.cb_orient.addItem(t, v)
+        self.cb_orient.layout_.addStretch(1)
 
         self.sp_scale = QSpinBox()
         self.sp_scale.setRange(10, 400)
@@ -1630,6 +1631,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.cb_scale.addItem("Fit", "fit")
         self.cb_scale.addItem("Actual size", "actual")
         self.cb_scale.addItem("Custom Scale:", "custom", extra=self.sp_scale)
+        self.cb_scale.layout_.addStretch(1)
 
         self.cb_persheet = QComboBox()
         for t, v in (("1 page per sheet (normal)", 1), ("2 pages per sheet", 2),
@@ -1697,43 +1699,41 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         for cb in (self.cb_source, self.cb_media):
             cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumContentsLength(4)
-            cb.setFixedWidth(122)
+            cb.setFixedWidth(116)
 
         row_printer = QHBoxLayout()
-        self.cb_printer.setMaximumWidth(140)                    # compact printer drop-down
+        self.cb_printer.setMaximumWidth(120)                    # compact printer drop-down
         self.cb_printer.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.cb_printer.setMinimumContentsLength(8)
         row_printer.addWidget(self.cb_printer, 1)
-        row_printer.addSpacing(8)
-        row_printer.addWidget(QLabel("Paper size:"))            # paper size sits between printer and Settings
+        row_printer.addSpacing(6)
+        row_printer.addWidget(QLabel("Size:"))                  # size / source / type sit between printer and Settings
         self.cb_paper.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.cb_paper.setMinimumContentsLength(7)
         self.cb_paper.setFixedWidth(84)
         row_printer.addWidget(self.cb_paper)
         row_printer.addSpacing(4)
-        row_printer.addWidget(QLabel("Paper source:"))
+        row_printer.addWidget(QLabel("Source:"))
         row_printer.addWidget(self.cb_source)
         row_printer.addSpacing(8)
-        row_printer.addWidget(QLabel("Paper type:"))
+        row_printer.addWidget(QLabel("Type:"))
         row_printer.addWidget(self.cb_media)
         row_printer.addSpacing(8)
         row_printer.addWidget(self.btn_printer_props)
         w_printer = QWidget()
         w_printer.setLayout(row_printer)
 
-        # Top strip, full width like Adobe: Printer + Properties, then Copies with the colour/toner ticks
+        # Top strip, full width: Printer, size, source, type and Settings in one line
         f1 = QFormLayout()
         f1.addRow("Printer:", w_printer)
         copies_row = QHBoxLayout()
+        copies_row.addWidget(QLabel("Copies:"))
         copies_row.addWidget(self.sp_copies)
-        copies_row.addSpacing(16)
+        copies_row.addSpacing(12)
         copies_row.addWidget(self.ck_grayscale)
         copies_row.addWidget(self.ck_save_toner)
         copies_row.addWidget(self.ck_compress)
         copies_row.addStretch(1)
-        w_copies = QWidget()
-        w_copies.setLayout(copies_row)
-        f1.addRow("Copies:", w_copies)
 
         # Page Sizing & Handling: paper, size (scale) radios, pages per sheet, both-sides ticks
         f2 = QFormLayout()
@@ -1746,15 +1746,17 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         v2 = QVBoxLayout()
         v2.setSpacing(8)
         v2.addLayout(f2)
-        v2.addWidget(self.ck_duplex)
-        v2.addWidget(self.w_flip)
+        v2.addWidget(QLabel("Orientation:"))
+        v2.addWidget(self.cb_orient.box)
         v2.addWidget(QLabel("Size:"))
         v2.addWidget(self.cb_scale.box)
         f_per = QFormLayout()
         f_per.addRow("Pages per sheet:", w_per)
         v2.addLayout(f_per)
-        v_orient = QVBoxLayout()
-        v_orient.addWidget(self.cb_orient.box)
+        v_duplex = QVBoxLayout()                               # two-sided printing, in the old Orientation spot
+        v_duplex.addWidget(self.ck_duplex)
+        v_duplex.addWidget(self.w_flip)
+        v_duplex.addStretch(1)
         f3 = QVBoxLayout()
         f3.addWidget(self.rb_all)
         f3.addWidget(self.rb_cur)
@@ -1763,12 +1765,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         row.addWidget(self.ed_range)
         f3.addLayout(row)
 
-        row_pg = QHBoxLayout()                                   # Pages to Print | Orientation, side by side
+        row_pg = QHBoxLayout()                                   # Pages to Print | Two-sided, side by side
         row_pg.setSpacing(10)
         row_pg.addWidget(box("Pages to Print", f3), 1)
-        row_pg.addWidget(box("Orientation", v_orient), 1)
+        row_pg.addWidget(box("Two-sided", v_duplex), 1)
         left = QVBoxLayout()
         left.setSpacing(10)
+        left.addLayout(copies_row)
         left.addLayout(row_pg)
         left.addWidget(box("Page Sizing && Handling", v2))
         left.addStretch(1)
@@ -1801,20 +1804,26 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         nav.addWidget(self.bt_prev)
         nav.addWidget(self.lbl_info, 1)
         nav.addWidget(self.bt_next)
-        lbl_hint = QLabel("Drag to move the content  •  Wheel to zoom  •  Double-click to reset zoom")
+        lbl_hint = QLabel("Drag: move  •  Wheel: zoom  •  Double-click: reset")
         lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_hint.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
         self.lbl_zoom = QLabel("100%")
         self.lbl_zoom.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
         rotate_row.insertWidget(0, self.bt_reset_pos)         # reset zoom + position
         rotate_row.addWidget(self.lbl_zoom)
+        lbl_hint.setWordWrap(True)
+        self.lbl_info.setWordWrap(True)
         right = QVBoxLayout()
-        right.addWidget(QLabel("Preview"))
-        right.addWidget(self.lbl_pv)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(6)
+        right.addWidget(self.lbl_pv, 0, Qt.AlignmentFlag.AlignHCenter)
         right.addLayout(rotate_row)
         right.addWidget(lbl_hint)
         right.addLayout(nav)
         right.addStretch(1)
+        w_right = QWidget()                                      # as wide as the preview, so it sits centred
+        w_right.setFixedWidth(self.PW + 24)
+        w_right.setLayout(right)
 
         self.btn_print = QPushButton("🖨 Print")
         self.btn_print.setDefault(True)
@@ -1825,16 +1834,19 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
 
-        left.addWidget(bb)                                       # Print / Cancel under the settings
         top = QHBoxLayout()
-        top.setSpacing(16)
-        top.addLayout(left, 0)
-        top.addLayout(right, 0)
+        top.setSpacing(14)
+        top.addLayout(left, 1)
+        top.addWidget(w_right, 0, Qt.AlignmentFlag.AlignTop)
+        row_btn = QHBoxLayout()                                  # Print / Cancel in the bottom-right corner
+        row_btn.addStretch(1)
+        row_btn.addWidget(bb)
         main = QVBoxLayout(self)
         main.setContentsMargins(16, 12, 16, 12)
         main.setSpacing(8)
         main.addLayout(f1)
-        main.addLayout(top)
+        main.addLayout(top, 1)
+        main.addLayout(row_btn)
         # tighter group boxes than the main window uses, so the whole dialog stays small
         self.setStyleSheet("QGroupBox{padding:28px 10px 8px 10px;}QGroupBox::title{top:7px;}")
 
@@ -2473,7 +2485,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.lbl_pv.setPixmap(pm)
 
         rng = f"{sheet[0] + 1}" + (f"–{sheet[-1] + 1}" if len(sheet) > 1 else "")
-        info = f"Sheet {self.pv + 1} / {len(grp)}  •  page(s) {rng}  •  {paper_label} {'landscape' if ls else 'portrait'}"
+        info = f"Sheet {self.pv + 1} / {len(grp)}  •  page(s) {rng}\n{paper_label} {'landscape' if ls else 'portrait'}"
         if duplex != "none":
             info += f"\nsheet {self.pv // 2 + 1}, {'front' if self.pv % 2 == 0 else 'back'}"
         self.lbl_info.setText(info)
