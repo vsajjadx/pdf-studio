@@ -246,9 +246,66 @@ if not (len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall", "--exp
 # ============================================================================
 #  EXPLORER CONTEXT MENU (registry, current user only - no admin needed)
 # ============================================================================
+_APP_EXE = None          # path of the installed copy of the exe, set by install_context_menu()
+
+
+def _app_exe():
+    return _APP_EXE or sys.executable
+
+
+def _install_dir():
+    return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Programs", "PDF Studio")
+
+
+def _registered_exe():
+    """The exe path that Explorer currently launches for PDFs (first quoted token of the open command)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            f"Software\\Classes\\{_APP_ID}\\shell\\open\\command") as k:
+            cmd = winreg.QueryValueEx(k, "")[0]
+    except OSError:
+        return None
+    m = re.match(r'\s*"([^"]+)"', cmd)
+    return m.group(1) if m else None
+
+
+def _deploy_exe():
+    """Frozen exe only: replace any previous version with this one. Stops running copies, removes the old
+    registration, start-menu link and settings, deletes the old exe and the install folder, then copies this exe
+    to a fixed per-user folder (no admin needed). Returns the installed exe path, or None when not frozen."""
+    if not getattr(sys, "frozen", False):
+        return None
+    me = os.path.abspath(sys.executable)
+    target = os.path.join(_install_dir(), "PDFStudio.exe")
+    if os.path.normcase(me) == os.path.normcase(target):
+        return target                                       # already running from the installed copy
+    import subprocess
+    old = _registered_exe()
+    try:                                                    # onefile = a launcher process + the real one: spare both
+        subprocess.run(["taskkill", "/F", "/IM", "PDFStudio.exe", "/FI", f"PID ne {os.getpid()}",
+                        "/FI", f"PID ne {os.getppid()}"], creationflags=0x08000000, timeout=15,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    time.sleep(0.5)                                         # let Windows release the old exe
+    uninstall_context_menu()
+    for stale in (old, target):
+        if (stale and os.path.basename(stale).lower() == "pdfstudio.exe"
+                and os.path.normcase(os.path.abspath(stale)) != os.path.normcase(me)):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    shutil.rmtree(_install_dir(), ignore_errors=True)
+    os.makedirs(_install_dir(), exist_ok=True)
+    shutil.copy2(me, target)
+    return target
+
+
 def _base_cmd():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return f'"{_app_exe()}"'
     py = sys.executable
     if py.lower().endswith("python.exe"):
         py = py[:-10] + "pythonw.exe"                       # no console window
@@ -302,7 +359,7 @@ def _create_start_menu_shortcut(icon_path):
     """Start-menu entry with the PDF Studio icon (uses PowerShell's WScript.Shell; silent on failure)."""
     import subprocess
     if getattr(sys, "frozen", False):
-        target, args = sys.executable, ""
+        target, args = _app_exe(), ""
     else:
         py = sys.executable
         if py.lower().endswith("python.exe"):
@@ -320,6 +377,8 @@ def _create_start_menu_shortcut(icon_path):
 
 
 def install_context_menu():
+    global _APP_EXE
+    _APP_EXE = _deploy_exe() or _APP_EXE                   # new install replaces the old version completely
     cmd = _base_cmd()
     icon = _icon_ref()                                      # exe resource when frozen, else a generated .ico
     # "Combine" in the right-click menu of PDFs and images (works for mixed selections)
@@ -349,20 +408,15 @@ def install_context_menu():
 
 
 def refresh_registration_if_stale():
-    """Explorer launches PDF Studio with the exe path that was written to the registry when the menu was
-    installed. If the exe was moved, replaced or run from a new folder, that path is dead and double-clicking
-    a PDF starts nothing. When an earlier install exists (never after --uninstall) and its command no longer
-    matches this exe, write the registration again with the current path. Runs in the background."""
+    """Explorer launches PDF Studio with the exe path that was written to the registry at install time. If that
+    file is gone (moved, deleted or replaced), double-clicking a PDF starts nothing. When an earlier install
+    exists (never after --uninstall) and its exe no longer exists, install again from the exe that is running now.
+    Runs in the background."""
     if sys.platform != "win32":
         return
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{_APP_ID}\\shell\\open\\command") as k:
-            registered = winreg.QueryValueEx(k, "")[0]
-    except OSError:
-        return                                              # never installed, or uninstalled: leave it alone
-    if registered == f'{_base_cmd()} "%1"':
-        return
+    registered = _registered_exe()
+    if registered is None or os.path.exists(registered):
+        return                                              # never installed / uninstalled, or still valid
     import threading
     threading.Thread(target=install_context_menu, daemon=True).start()
 
@@ -384,6 +438,9 @@ def uninstall_context_menu():
         os.remove(_start_menu_link())
     except OSError:
         pass
+    if (getattr(sys, "frozen", False) and os.path.isdir(_install_dir())
+            and not os.path.normcase(os.path.abspath(sys.executable)).startswith(os.path.normcase(_install_dir()))):
+        shutil.rmtree(_install_dir(), ignore_errors=True)   # the installed copy, unless it is the one running
     _notify_assoc_changed()
 
 
@@ -515,7 +572,7 @@ def save_ico(path, sizes=(16, 24, 32, 48, 64, 128, 256)):
 def _icon_ref():
     """Icon location string for the registry: the exe itself when frozen, otherwise a generated .ico file."""
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}",0'
+        return f'"{_app_exe()}",0'
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     path = os.path.join(base, "PDFStudio", "pdfstudio.ico")
     save_ico(path)
@@ -3994,7 +4051,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall"):
         (install_context_menu if sys.argv[1] == "--install" else uninstall_context_menu)()
         if sys.argv[1] == "--install":
-            _msg("Installed.\nSettings > Default apps will open now: search 'PDF Studio' (or .pdf) and set it as default.", 0x40)
+            _msg(f"Installed (previous version removed):\n{_app_exe()}\n\nSettings > Default apps will open now: "
+                 "search 'PDF Studio' (or .pdf) and set it as default.", 0x40)
             try:
                 os.startfile("ms-settings:defaultapps")
             except OSError:
