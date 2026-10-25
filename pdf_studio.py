@@ -452,10 +452,10 @@ from PyQt6.QtCore import (Qt, QSize, QSizeF, QPoint, QPointF, QRectF, QMarginsF,
                           QMimeData, QObject, QSettings, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDrag, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
                          QPalette, QPixmap, QPainter, QPen, QPainterPath, QPageLayout, QPageSize, QRadialGradient,
-                         QTextCursor, QTransform, QIntValidator)
+                         QTextCursor, QTextBlockFormat, QTransform, QIntValidator)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrinter, QPrinterInfo
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                              QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect,
                              QGridLayout, QGroupBox, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -2710,41 +2710,327 @@ def _apply_redactions(page, images=None, graphics=None, text=None):
         page.apply_redactions(images=kw["images"])
 
 
-def _emit_text(page, text, origin, size, flags, color, box=None):
-    """Write one line of text onto the page at `origin` (baseline-left). Latin text uses the standard PDF fonts
-    (matching bold / italic / serif of the original); other scripts (Persian, Arabic ...) are shaped by the HTML engine."""
-    if not text:
-        return
-    size = max(1.0, float(size))
-    if all(ord(ch) < 256 for ch in text):
-        pre = "ti" if flags & 4 else "he"
-        fn = {"ti": {"ro": "tiro", "bo": "tibo", "it": "tiit", "bi": "tibi"},
-              "he": {"lv": "helv", "bo": "hebo", "it": "heit", "bi": "hebi"}}[pre]
-        key = {(0, 0): "ro" if pre == "ti" else "lv", (1, 0): "bo", (0, 1): "it", (1, 1): "bi"}[
-            (1 if flags & 16 else 0, 1 if flags & 2 else 0)]
-        page.insert_text(fitz.Point(origin), text, fontsize=size, fontname=fn[key], color=color)
-        return
-    rtl = bool(re.search(r"[\u0590-\u08FF\uFB50-\uFEFF]", text))
-    fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-    css = (f'@font-face{{font-family:ft;src:url("tahoma.ttf");}}'
-           f'*{{font-family:ft;font-size:{size}pt;'
-           f'color:rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)});}}p{{margin:0}}')
-    if box is None:
-        box = fitz.Rect(origin.x, origin.y - size, origin.x + size * max(2, len(text)), origin.y + size * 0.4)
-    box = fitz.Rect(box.x0 - (60 if rtl else 0), box.y0 - 2, box.x1 + (0 if rtl else 60), box.y1 + 2)
+# ---- fonts: keep the original font of edited text, or use the one picked in the Edit bar ----------------------------
+_RTL_RE = re.compile(r"[\u0590-\u08FF\uFB50-\uFEFF]")
+_STYLE_WORDS = {"bold", "italic", "oblique", "regular", "normal", "bolditalic", "boldoblique"}
+_SYS_FONTS = None                       # normalised family -> {(bold, italic): file}
+_SYS_FAMILY_NAMES = {}                  # normalised family -> display name
+
+
+def _fam_key(s):
+    return re.sub(r"[^0-9a-z\u0080-\uffff]", "", (s or "").lower())
+
+
+def _pdf_font_parts(name, flags=0):
+    """'ABCDEF+Arial-BoldMT' -> ('arial', bold, italic)."""
+    n = re.sub(r"^[A-Z]{6}\+", "", name or "")
+    low = n.lower()
+    bold = bool(flags & 16) or "bold" in low or "black" in low or "heavy" in low
+    italic = bool(flags & 2) or "italic" in low or "oblique" in low
+    low = re.sub(r"(bold|italic|oblique|regular|roman|normal|black|heavy|semibold|light|medium)", "", low)
+    low = _fam_key(low)
+    low = re.sub(r"(psmt|mt|ps)+$", "", low)
+    return low, bold, italic
+
+
+def _split_style(display):
+    name = re.sub(r"\s*\((TrueType|OpenType|All res|Type 1)[^)]*\)\s*$", "", display).strip()
+    words, bold, italic = name.split(), False, False
+    while words and words[-1].lower() in _STYLE_WORDS:
+        w = words.pop().lower()
+        bold = bold or "bold" in w
+        italic = italic or "italic" in w or "oblique" in w
+    return " ".join(words), bold, italic
+
+
+def _system_fonts():
+    global _SYS_FONTS
+    if _SYS_FONTS is not None:
+        return _SYS_FONTS
+    idx = {}
+
+    def add(family, bold, italic, path):
+        k = _fam_key(family)
+        if k and path and os.path.isfile(path) and path.lower().endswith((".ttf", ".otf")):
+            idx.setdefault(k, {}).setdefault((bold, italic), path)
+            _SYS_FAMILY_NAMES.setdefault(k, family)
     try:
-        page.insert_htmlbox(box, f'<p dir="{"rtl" if rtl else "ltr"}" style="text-align:'
-                                 f'{"right" if rtl else "left"}">{_html.escape(text)}</p>',
-                            css=css, archive=fitz.Archive(fonts))
-    except Exception:                                       # no Windows fonts (other OS): keep what Latin-1 can show
-        page.insert_text(fitz.Point(origin), text.encode("latin-1", "replace").decode("latin-1"),
+        import winreg
+        wdir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        for hive, base in ((winreg.HKEY_LOCAL_MACHINE, wdir),
+                           (winreg.HKEY_CURRENT_USER, os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                                                   r"Microsoft\Windows\Fonts"))):
+            try:
+                key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+            except OSError:
+                continue
+            i = 0
+            while True:
+                try:
+                    disp, val, _t = winreg.EnumValue(key, i)
+                except OSError:
+                    break
+                i += 1
+                if "&" in disp:
+                    continue
+                fam, b, it = _split_style(disp)
+                add(fam, b, it, val if os.path.isabs(val) else os.path.join(base, val))
+    except ImportError:                                     # not Windows (tests / other systems): ask fontconfig
+        try:
+            import subprocess
+            out = subprocess.run(["fc-list", "--format", "%{file}|%{family[0]}|%{style[0]}\\n"],
+                                 capture_output=True, text=True, timeout=20).stdout
+            for ln in out.splitlines():
+                parts = ln.split("|")
+                if len(parts) == 3:
+                    st = parts[2].lower()
+                    add(parts[1], "bold" in st, "italic" in st or "oblique" in st, parts[0])
+        except Exception:
+            pass
+    _SYS_FONTS = idx
+    return idx
+
+
+def font_families():
+    """Display names of the fonts that can be applied to text (installed system fonts)."""
+    _system_fonts()
+    return sorted(_SYS_FAMILY_NAMES.values(), key=str.lower)
+
+
+def _find_system_font(fam_key, bold, italic):
+    d = _system_fonts().get(fam_key)
+    if not d:
+        return None
+    for k in ((bold, italic), (bold, False), (False, italic), (False, False)):
+        if k in d:
+            return d[k]
+    return next(iter(d.values()))
+
+
+class _FontSpec:
+    """A font ready to write with: embedded / system file (Unicode, TrueType) or one of the 14 standard fonts."""
+    def __init__(self, key, buf=None, path=None, base14=None):
+        self.key, self.buf, self.path, self.base14 = key, buf, path, base14
+        self.font = None
+        if base14:
+            self.font = fitz.Font(base14)
+        else:
+            self.font = fitz.Font(fontbuffer=buf) if buf else fitz.Font(fontfile=path)
+
+    def covers(self, text):
+        if self.base14:
+            return all(ord(c) < 256 for c in text)
+        try:
+            return all(self.font.has_glyph(ord(c)) for c in text if not c.isspace())
+        except Exception:
+            return False
+
+    def length(self, text, size):
+        try:
+            return self.font.text_length(text, fontsize=size)
+        except Exception:
+            return len(text) * size * 0.5
+
+    def data(self):
+        if self.buf:
+            return self.buf
+        with open(self.path, "rb") as fh:
+            return fh.read()
+
+
+def _base14_name(flags, bold, italic):
+    if flags & 8:                                           # monospaced
+        return {(0, 0): "cour", (1, 0): "cobo", (0, 1): "coit", (1, 1): "cobi"}[(int(bold), int(italic))]
+    if flags & 4:                                           # serif
+        return {(0, 0): "tiro", (1, 0): "tibo", (0, 1): "tiit", (1, 1): "tibi"}[(int(bold), int(italic))]
+    return {(0, 0): "helv", (1, 0): "hebo", (0, 1): "heit", (1, 1): "hebi"}[(int(bold), int(italic))]
+
+
+_FALLBACK_FAMILIES = ("tahoma", "arial", "segoeui", "calibri", "dejavusans", "notosansarabic", "notosans",
+                      "freesans", "liberationsans")
+
+
+def _embedded_font_buf(doc, page, pdf_font, cache):
+    k = ("emb", id(doc), pdf_font)
+    if k in cache:
+        return cache[k]
+    buf = None
+    try:
+        want = _fam_key(re.sub(r"^[A-Z]{6}\+", "", pdf_font or ""))
+        for f in page.get_fonts(full=True):
+            if _fam_key(re.sub(r"^[A-Z]{6}\+", "", f[3] or "")) == want:
+                _n, ext, _t, content = doc.extract_font(f[0])
+                if content and ext in ("ttf", "otf", "ttc"):
+                    buf = content
+                break
+    except Exception:
+        buf = None
+    cache[k] = buf
+    return buf
+
+
+def _spec_for(cache, key, **kw):
+    if key not in cache:
+        try:
+            cache[key] = _FontSpec(key, **kw)
+        except Exception:
+            cache[key] = None
+    return cache[key]
+
+
+def _resolve_font(page, style, text, cache):
+    """Pick the font for `text`: the user's choice, else the PDF's own font (embedded or the same family on this
+    PC), else a stand-in that has the needed letters."""
+    flags = style.get("flags", 0)
+    fam_key, bold, italic = _pdf_font_parts(style.get("font"), flags)
+    if style.get("family"):                                 # picked in the Edit bar
+        fam_key = _fam_key(style["family"])
+        bold, italic = bool(flags & 16), bool(flags & 2)
+        user = True
+    else:
+        user = False
+    tried = []
+    if not user and style.get("font"):
+        buf = _embedded_font_buf(page.parent, page, style["font"], cache)
+        if buf:
+            tried.append(_spec_for(cache, ("buf", id(page.parent), style["font"]), buf=buf))
+    p = _find_system_font(fam_key, bold, italic)
+    if p:
+        tried.append(_spec_for(cache, ("file", p), path=p))
+    for t in tried:
+        if t is not None and t.covers(text):
+            return t
+    rtl_or_wide = any(ord(c) >= 256 for c in text)
+    if not rtl_or_wide:
+        return _spec_for(cache, ("b14", _base14_name(flags, bold, italic)), base14=_base14_name(flags, bold, italic))
+    for fk in _FALLBACK_FAMILIES:
+        p = _find_system_font(fk, bold, italic)
+        if p:
+            s = _spec_for(cache, ("file", p), path=p)
+            if s is not None and s.covers(text):
+                return s
+    for fk, d in _system_fonts().items():                   # any installed font that has these letters
+        p = d.get((bold, italic)) or next(iter(d.values()))
+        s = _spec_for(cache, ("file", p), path=p)
+        if s is not None and s.covers(text):
+            return s
+    return _spec_for(cache, ("b14", "helv"), base14="helv")
+
+
+def _text_width(page, text, style, cache):
+    return _resolve_font(page, style, text, cache).length(text, style["size"])
+
+
+def _remove_draws(page, draws):
+    """Take vector objects off the page. Shapes are first removed only if they lie completely inside their own
+    (slightly widened) area, so a shape standing close by is left alone; whatever is still there afterwards is
+    removed with the 'touched' rule. Empty frames are removed along their four edges."""
+    FULL = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_COVERED", 1)
+    TOUCH = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED", 2)
+    NOIMG = getattr(fitz, "PDF_REDACT_IMAGE_NONE", 0)
+    NOTXT = getattr(fitz, "PDF_REDACT_TEXT_NONE", 1)
+
+    def run(rects, mode):
+        for rc in rects:
+            page.add_redact_annot(rc, fill=False)
+        try:
+            page.apply_redactions(images=NOIMG, graphics=mode, text=NOTXT)
+        except TypeError:
+            page.apply_redactions(images=NOIMG)
+
+    solid = [o for o in draws if not o.get("hollow")]
+    hollow = [o for o in draws if o.get("hollow")]
+    if solid:
+        rects = []
+        for o in solid:
+            m = max([(p.get("width") or 1.0) for p in o["paths"]] + [1.0]) * 6 + 2     # room for the stroke's mitre reach
+            rects.append(fitz.Rect(o["rect"]) + (-m, -m, m, m))
+        run(rects, FULL)
+        try:
+            left = page.get_drawings()
+        except Exception:
+            left = []
+        rest = []
+        for o in solid:
+            for p in o["paths"]:
+                pr = p["rect"]
+                if any(abs(d["rect"].x0 - pr.x0) < 0.6 and abs(d["rect"].y0 - pr.y0) < 0.6
+                       and abs(d["rect"].x1 - pr.x1) < 0.6 and abs(d["rect"].y1 - pr.y1) < 0.6 for d in left):
+                    rest.append(o)
+                    break
+        if rest:
+            run([fitz.Rect(o["rect"]) + (0.4, 0.4, -0.4, -0.4) for o in rest], TOUCH)
+    if hollow:
+        rects = []
+        for o in hollow:
+            r = fitz.Rect(o["rect"])
+            t = max(1.0, (o["paths"][0].get("width") or 1.0)) / 2 + 1.5
+            rects += [fitz.Rect(r.x0 - t, r.y0 - t, r.x1 + t, r.y0 + t), fitz.Rect(r.x0 - t, r.y1 - t, r.x1 + t, r.y1 + t),
+                      fitz.Rect(r.x0 - t, r.y0 - t, r.x0 + t, r.y1 + t), fitz.Rect(r.x1 - t, r.y0 - t, r.x1 + t, r.y1 + t)]
+        run(rects, TOUCH)
+
+
+def _emit_text(page, text, baseline_y, style, align, x0, x1, cache=None):
+    """Write one line of text with its baseline at `baseline_y`. `align` ('left' / 'center' / 'right') says which of the
+    container edges x0 / x1 (or its middle) the text sticks to. Keeps the original font; Persian / Arabic are shaped
+    by the HTML engine."""
+    if not text or not text.strip():
+        return
+    cache = {} if cache is None else cache
+    size = max(1.0, float(style["size"]))
+    color = style.get("color", (0, 0, 0))
+    spec = _resolve_font(page, style, text, cache)
+    w = spec.length(text, size)
+    rtl = bool(_RTL_RE.search(text))
+    if align == "right":
+        left = x1 - w
+    elif align == "center":
+        left = (x0 + x1) / 2 - w / 2
+    else:
+        left = x0
+    if not rtl:
+        if spec.base14:
+            page.insert_text(fitz.Point(left, baseline_y), text, fontsize=size, fontname=spec.base14, color=color)
+        else:
+            page.insert_font(fontname=spec.key if isinstance(spec.key, str) else "F" + str(abs(hash(spec.key)) % 10**8),
+                             fontbuffer=spec.data())
+            page.insert_text(fitz.Point(left, baseline_y), text, fontsize=size,
+                             fontname=spec.key if isinstance(spec.key, str) else "F" + str(abs(hash(spec.key)) % 10**8),
+                             color=color)
+        return
+    # right-to-left / shaped text: HTML engine with the chosen font
+    try:
+        asc = abs(getattr(spec.font, "ascender", 0.9)) or 0.9
+        desc = abs(getattr(spec.font, "descender", 0.25)) or 0.25
+        lh = size * max(1.2, asc + desc)
+        top = baseline_y - ((lh - (asc + desc) * size) / 2 + asc * size)
+        bw = w * 1.35 + 24
+        if align == "right":
+            bx0, bx1 = x1 - bw, x1
+        elif align == "center":
+            bx0, bx1 = (x0 + x1) / 2 - bw / 2, (x0 + x1) / 2 + bw / 2
+        else:
+            bx0, bx1 = x0, x0 + bw
+        box = fitz.Rect(bx0, top - 2, bx1, top + lh + 4)
+        arch = fitz.Archive()
+        arch.add(spec.data() if not spec.base14 else b"", "ft.ttf")
+        face = '@font-face{font-family:ft;src:url("ft.ttf");}' if not spec.base14 else ""
+        css = (f'{face}*{{font-family:{"ft" if not spec.base14 else "sans-serif"};font-size:{size}pt;'
+               f'color:rgb({int(color[0]*255)},{int(color[1]*255)},{int(color[2]*255)});white-space:nowrap}}'
+               f'p{{margin:0;line-height:{lh}pt}}')
+        ta = {"right": "left", "left": "right", "center": "center"}[align if align in ("left", "right", "center") else "left"]   # MuPDF's rtl text-align means start / end
+        page.insert_htmlbox(box, f'<p dir="rtl" style="text-align:{ta}">{_html.escape(text)}</p>', css=css, archive=arch)
+    except Exception:
+        page.insert_text(fitz.Point(left, baseline_y), text.encode("latin-1", "replace").decode("latin-1"),
                          fontsize=size, fontname="helv", color=color)
 
 
-def _redraw_path(page, path, T, avg):
-    """Draw a vector path again with every point passed through T (move / scale)."""
+def _redraw_path(page, path, T, avg, ov=None):
+    """Draw a vector path again with every point passed through T (move / scale). `ov` = new look picked in the
+    Edit bar: keys color (outline), fill, width, dash."""
     if not path.get("items"):
         return
+    ov = ov or {}
     sh = page.new_shape()
     for it in path["items"]:
         op = it[0]
@@ -2758,14 +3044,23 @@ def _redraw_path(page, path, T, avg):
         elif op == "qu":
             q = it[1]
             sh.draw_quad(fitz.Quad(T(q.ul), T(q.ur), T(q.ll), T(q.lr)))
-    fill, color = path.get("fill"), path.get("color")
+    fill = ov["fill"] if "fill" in ov else path.get("fill")
+    color = ov["color"] if "color" in ov else path.get("color")
     if fill is None and color is None:
-        return
+        fill, color = path.get("fill"), path.get("color")
+        if fill is None and color is None:
+            return
+    base_w = ov["width"] if "width" in ov else (path.get("width") or 1.0)
+    if color is None and "color" not in ov and fill is not None:
+        base_w = path.get("width") or 1.0
     cap = path.get("lineCap") or (0,)
     dashes = path.get("dashes")
+    dashes = dashes if dashes and dashes.strip() not in ("[] 0", "") else None
+    if "dash" in ov:
+        dashes = _dash_string(ov["dash"], base_w)
     try:
-        sh.finish(fill=fill, color=color, width=max(0.05, (path.get("width") or 1.0) * avg),
-                  dashes=dashes if dashes and dashes.strip() not in ("[] 0", "") else None,
+        sh.finish(fill=fill, color=color, width=max(0.05, base_w * (1 if "width" in ov else avg)),
+                  dashes=dashes,
                   even_odd=bool(path.get("even_odd")), closePath=bool(path.get("closePath")),
                   lineCap=int(cap[0]) if isinstance(cap, (tuple, list)) else int(cap),
                   fill_opacity=path.get("fill_opacity") if path.get("fill_opacity") is not None else 1,
@@ -2775,25 +3070,237 @@ def _redraw_path(page, path, T, avg):
         pass
 
 
+# ---- ready-made shapes and page borders ---------------------------------------------------------------------------
+SHAPES = [("line", "Line"), ("arrow", "Arrow"), ("rect", "Rectangle"), ("square", "Square"),
+          ("rrect", "Rounded rectangle"), ("ellipse", "Ellipse"), ("circle", "Circle"),
+          ("triangle", "Triangle"), ("rtriangle", "Right triangle"), ("diamond", "Diamond"),
+          ("pentagon", "Pentagon"), ("hexagon", "Hexagon"), ("star", "Star"), ("plus", "Plus"),
+          ("rarrow", "Block arrow")]
+SQUARE_SHAPES = {"square", "circle"}                    # always drawn 1:1
+LINE_SHAPES = {"line", "arrow"}
+DASH_STYLES = [("solid", "Solid"), ("dashed", "Dashed"), ("dotted", "Dotted")]
+
+
+def _regular_poly(n, star=False):
+    pts = []
+    for k in range(n * (2 if star else 1)):
+        a = -math.pi / 2 + k * (math.pi / n if star else 2 * math.pi / n)
+        r = 1.0 if (not star or k % 2 == 0) else 0.382
+        pts.append((r * math.cos(a), r * math.sin(a)))
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    return [((x - x0) / (x1 - x0), (y - y0) / (y1 - y0)) for x, y in pts]
+
+
+_UNIT_POLYS = {
+    "triangle": [(.5, 0), (1, 1), (0, 1)],
+    "rtriangle": [(0, 0), (0, 1), (1, 1)],
+    "diamond": [(.5, 0), (1, .5), (.5, 1), (0, .5)],
+    "hexagon": [(.25, 0), (.75, 0), (1, .5), (.75, 1), (.25, 1), (0, .5)],
+    "plus": [(1/3, 0), (2/3, 0), (2/3, 1/3), (1, 1/3), (1, 2/3), (2/3, 2/3), (2/3, 1), (1/3, 1), (1/3, 2/3),
+             (0, 2/3), (0, 1/3), (1/3, 1/3)],
+    "rarrow": [(0, .3), (.6, .3), (.6, 0), (1, .5), (.6, 1), (.6, .7), (0, .7)],
+}
+
+
+def _shape_geom(kind, x0, y0, x1, y1, width=1.0):
+    """Drawing primitives of a shape inside the box (x0,y0)-(x1,y1) (page points)."""
+    l, r, t, b = min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)
+    w, h = r - l, b - t
+    if kind in ("line", "arrow"):
+        if kind == "line":
+            return [{"t": "poly", "pts": [(x0, y0), (x1, y1)], "closed": False}]
+        ln = math.hypot(x1 - x0, y1 - y0) or 1.0
+        ux, uy = (x1 - x0) / ln, (y1 - y0) / ln
+        head = min(max(10.0, width * 4.5), ln * 0.45)
+        bx, by = x1 - ux * head, y1 - uy * head
+        nx, ny = -uy, ux
+        return [{"t": "poly", "pts": [(x0, y0), (bx, by)], "closed": False},
+                {"t": "poly", "pts": [(x1, y1), (bx + nx * head * .42, by + ny * head * .42),
+                                      (bx - nx * head * .42, by - ny * head * .42)], "closed": True, "solid": True}]
+    if kind in ("rect", "square"):
+        return [{"t": "rect", "r": (l, t, r, b)}]
+    if kind == "rrect":
+        return [{"t": "rrect", "r": (l, t, r, b), "k": 0.18}]
+    if kind in ("ellipse", "circle"):
+        return [{"t": "oval", "r": (l, t, r, b)}]
+    if kind == "pentagon":
+        unit = _regular_poly(5)
+    elif kind == "star":
+        unit = _regular_poly(5, star=True)
+    else:
+        unit = _UNIT_POLYS.get(kind, [(0, 0), (1, 0), (1, 1), (0, 1)])
+    return [{"t": "poly", "pts": [(l + fx * w, t + fy * h) for fx, fy in unit], "closed": True}]
+
+
+def _dash_string(style, width):
+    w = max(0.5, float(width))
+    if style == "dashed":
+        return f"[{3 * w:.2f} {2 * w:.2f}] 0"
+    if style == "dotted":
+        return f"[0 {2 * w:.2f}] 0"
+    return None
+
+
+def _draw_shape_pdf(page, kind, x0, y0, x1, y1, stroke, fill, width, dash):
+    """Draw a ready-made shape onto the page. stroke / fill are RGB tuples in 0..1 or None."""
+    if stroke is None and fill is None:
+        stroke = (0, 0, 0)
+    width = max(0.1, float(width))
+    dashes = _dash_string(dash, width)
+    cap = 1 if dash == "dotted" else 0
+    sh = page.new_shape()
+    for pr in _shape_geom(kind, x0, y0, x1, y1, width):
+        t = pr["t"]
+        if t == "poly":
+            pts = [fitz.Point(*p) for p in pr["pts"]]
+            sh.draw_polyline(pts)
+            if pr.get("solid"):
+                sh.finish(fill=stroke or fill, color=stroke or fill, width=0.2, closePath=True, lineJoin=1)
+            elif pr["closed"]:
+                sh.finish(fill=fill, color=stroke, width=width, dashes=dashes, closePath=True, lineJoin=1, lineCap=cap)
+            else:
+                sh.finish(fill=None, color=stroke or fill, width=width, dashes=dashes, closePath=False, lineCap=1, lineJoin=1)
+        else:
+            rr = fitz.Rect(*pr["r"])
+            if t == "oval":
+                sh.draw_oval(rr)
+            elif t == "rrect":
+                sh.draw_rect(rr, radius=pr["k"])
+            else:
+                sh.draw_rect(rr)
+            sh.finish(fill=fill, color=stroke, width=width, dashes=dashes, closePath=True, lineJoin=1, lineCap=cap)
+    sh.commit()
+
+
+def _draw_border(page, color, width, margin, style, radius):
+    """Frame around the page: style 'solid' / 'dashed' / 'dotted' / 'double'."""
+    r = page.rect
+    box = fitz.Rect(r.x0 + margin, r.y0 + margin, r.x1 - margin, r.y1 - margin)
+    if box.width < 10 or box.height < 10:
+        return
+    rects, w, dash = [(box, width)], width, style if style in ("dashed", "dotted") else None
+    if style == "double":
+        w = max(0.5, width / 3.0)
+        gap = w * 1.6
+        inner = fitz.Rect(box.x0 + w + gap, box.y0 + w + gap, box.x1 - w - gap, box.y1 - w - gap)
+        rects = [(box, w)] + ([(inner, w)] if inner.width > 4 and inner.height > 4 else [])
+    for rc, ww in rects:
+        sh = page.new_shape()
+        k = min(0.5, max(0.0, radius / max(1.0, min(rc.width, rc.height)))) if radius > 0 else None
+        sh.draw_rect(rc, radius=k) if k else sh.draw_rect(rc)
+        sh.finish(fill=None, color=color, width=ww, dashes=_dash_string(dash, ww), closePath=True, lineJoin=1,
+                  lineCap=1 if dash == "dotted" else 0)
+        sh.commit()
+
+
+def _shape_qpath(kind, x0, y0, x1, y1, width=1.0):
+    """The same shape as a QPainterPath (for the live preview and the toolbar icons). Returns (outline, solid parts)."""
+    outline, solid = QPainterPath(), QPainterPath()
+    for pr in _shape_geom(kind, x0, y0, x1, y1, width):
+        t = pr["t"]
+        tgt = solid if pr.get("solid") else outline
+        if t == "poly":
+            pts = [QPointF(*p) for p in pr["pts"]]
+            tgt.moveTo(pts[0])
+            for p in pts[1:]:
+                tgt.lineTo(p)
+            if pr["closed"]:
+                tgt.closeSubpath()
+        else:
+            rr = QRectF(QPointF(pr["r"][0], pr["r"][1]), QPointF(pr["r"][2], pr["r"][3]))
+            if t == "oval":
+                tgt.addEllipse(rr)
+            elif t == "rrect":
+                rad = min(rr.width(), rr.height()) * pr["k"]
+                tgt.addRoundedRect(rr, rad, rad)
+            else:
+                tgt.addRect(rr)
+    return outline, solid
+
+
+def _shape_icon(kind, color="#BBBBBB", size=22):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pad = 4
+    if kind in LINE_SHAPES:
+        out, solid = _shape_qpath(kind, pad, size - pad, size - pad, pad, 1.0)
+    else:
+        out, solid = _shape_qpath(kind, pad, pad + 1, size - pad, size - pad - 1, 1.0)
+    pen = QPen(QColor(color), 1.6)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPath(out)
+    p.setBrush(QColor(color))
+    p.drawPath(solid)
+    p.end()
+    return QIcon(pm)
+
+
+def _align_icon(kind, color="#BBBBBB", size=20):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setPen(QPen(QColor(color), 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    widths = [14, 9, 12, 7]
+    for i, wd in enumerate(widths):
+        y = 4.5 + i * 3.6
+        x = 3 if kind == "left" else (size - 3 - wd if kind == "right" else (size - wd) / 2)
+        p.drawLine(QPointF(x, y), QPointF(x + wd, y))
+    p.end()
+    return QIcon(pm)
+
+
 class InlineTextEditor(QPlainTextEdit):
-    """Small text box that appears on the page while a text object is typed into."""
+    """Small text box that appears on the page while a text object is typed into. It shows the chosen font, size,
+    colour, alignment and line spacing live; `fmt` collects what the user changed in the Edit bar meanwhile."""
     committed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, parent, text, px_size, width, height):
+    def __init__(self, parent, text, width, height, look, keep=None):
         super().__init__(parent)
         self._done = False
-        f = QFont("Arial")
-        f.setPixelSize(max(8, int(px_size)))
-        self.setFont(f)
+        self.keep = keep                                    # the Edit bar: clicking it must not close the editor
+        self.fmt = {}
+        self.look = dict(look)
         self.setPlainText(text)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setStyleSheet(f"QPlainTextEdit{{background:rgba(255,255,255,235);color:#111;"
-                           f"border:2px solid {ACCENT};selection-background-color:{ACCENT};}}")
         self.document().setDocumentMargin(2)
-        self.resize(int(max(width, 60)), int(max(height, px_size * 1.6)))
+        self.resize(int(max(width, 60)), int(max(height, look["px"] * 1.6)))
+        self.apply_look()
         self.moveCursor(QTextCursor.MoveOperation.End)
+
+    def set_look(self, **kw):
+        self.look.update(kw)
+        self.apply_look()
+
+    def apply_look(self):
+        lk = self.look
+        f = QFont(lk.get("family") or "Arial")
+        f.setPixelSize(max(8, int(lk["px"])))
+        f.setBold(bool(lk.get("bold")))
+        f.setItalic(bool(lk.get("italic")))
+        self.setFont(f)
+        col = QColor(*[int(c * 255) for c in lk.get("color", (0, 0, 0))])
+        lum = 0.299 * col.red() + 0.587 * col.green() + 0.114 * col.blue()
+        bg = "rgba(255,255,255,235)" if lum < 180 else "rgba(40,40,40,235)"
+        self.setStyleSheet(f"QPlainTextEdit{{background:{bg};color:{col.name()};"
+                           f"border:2px solid {ACCENT};selection-background-color:{ACCENT};}}")
+        opt = self.document().defaultTextOption()
+        opt.setAlignment({"center": Qt.AlignmentFlag.AlignHCenter, "right": Qt.AlignmentFlag.AlignRight}.get(
+            lk.get("align"), Qt.AlignmentFlag.AlignLeft))
+        self.document().setDefaultTextOption(opt)
+        sp = lk.get("spacing")
+        cur = QTextCursor(self.document())
+        cur.select(QTextCursor.SelectionType.Document)
+        bf = QTextBlockFormat()
+        bf.setLineHeight(float(sp) / 1.2 * 100 if sp else 100.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+        cur.mergeBlockFormat(bf)
 
     def _finish(self, ok):
         if self._done:
@@ -2815,7 +3322,386 @@ class InlineTextEditor(QPlainTextEdit):
 
     def focusOutEvent(self, e):
         super().focusOutEvent(e)
+        if e.reason() in (Qt.FocusReason.PopupFocusReason, Qt.FocusReason.ActiveWindowFocusReason):
+            return                                          # a drop-down / colour dialog opened, or the window lost focus
+        fw = QApplication.focusWidget()
+        if self.keep is not None and fw is not None and (fw is self.keep or self.keep.isAncestorOf(fw)):
+            return                                          # the user went to the Edit bar to change the look
         self._finish(True)
+
+
+def _swatch_icon(color, size=18):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    if color is None:
+        p.setPen(QPen(QColor("#888"), 1))
+        p.setBrush(QColor("#fff"))
+        p.drawRoundedRect(QRectF(1.5, 1.5, size - 3, size - 3), 3, 3)
+        p.setPen(QPen(QColor("#d33"), 1.6))
+        p.drawLine(QPointF(3, size - 3), QPointF(size - 3, 3))
+    else:
+        c = QColor(*[int(v * 255) for v in color])
+        p.setPen(QPen(QColor(0, 0, 0, 90), 1))
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(1.5, 1.5, size - 3, size - 3), 3, 3)
+    p.end()
+    return QIcon(pm)
+
+
+class EditPanel(QFrame):
+    """The bar under the toolbar while Edit is on: text font / size / colour / alignment / line spacing,
+    ready-made shapes with their line and fill, and page borders."""
+    fmt_changed = pyqtSignal(str, object)               # family / size / bold / italic / color / align / spacing
+    shape_style_changed = pyqtSignal(str, object)       # stroke / fill / width / dash
+    tool_changed = pyqtSignal(object)                   # shape kind being drawn, or None
+    border_requested = pyqtSignal()
+    arrange = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("EditPanel")
+        self._text_color = (0.0, 0.0, 0.0)
+        self._stroke, self._fill = (0.0, 0.0, 0.0), None
+        self._align = None
+        self._kind = "rect"
+        self.setStyleSheet(
+            f"#EditPanel{{background:{T['PANEL']};border-bottom:1px solid {T['LINE']};}}"
+            f"#EditPanel QLabel{{color:{T['MUTED']};}}"
+            f"#EditPanel QToolButton{{background:transparent;border:1px solid transparent;border-radius:4px;"
+            f"padding:2px 6px;color:{T['TEXT']};min-height:22px;}}"
+            f"#EditPanel QToolButton:hover{{background:{T['HOVER']};}}"
+            f"#EditPanel QToolButton:checked{{background:{T['SEL']};border-color:{T['ACC']};color:{T['SEL_TEXT']};}}"
+            f"#EditPanel QToolButton::menu-indicator{{image:none;width:0px;}}")
+        col = QVBoxLayout(self)
+        col.setContentsMargins(8, 4, 8, 4)
+        col.setSpacing(3)
+
+        # ---- row 1: text ----
+        r1 = QHBoxLayout()
+        r1.setSpacing(4)
+        r1.addWidget(QLabel("Text"))
+        self.font_box = QComboBox()
+        self.font_box.setEditable(True)
+        self.font_box.setMinimumWidth(190)
+        self.font_box.setMaximumWidth(240)
+        self.font_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        fams = font_families()
+        self.font_box.addItems(fams)
+        for i, name in enumerate(fams):
+            self.font_box.setItemData(i, QFont(name), Qt.ItemDataRole.FontRole)
+        self.font_box.setCurrentIndex(-1)
+        self.font_box.setToolTip("Font of the selected text (blank = the text's own font)")
+        self.font_box.activated.connect(lambda _i: self._emit_family())
+        self.font_box.lineEdit().editingFinished.connect(self._emit_family_typed)
+        r1.addWidget(self.font_box)
+        self.size_box = QDoubleSpinBox()
+        self.size_box.setRange(1, 500)
+        self.size_box.setDecimals(1)
+        self.size_box.setSingleStep(0.5)
+        self.size_box.setValue(12)
+        self.size_box.setSuffix(" pt")
+        self.size_box.setToolTip("Font size")
+        self.size_box.valueChanged.connect(lambda v: self.fmt_changed.emit("size", float(v)))
+        r1.addWidget(self.size_box)
+        self.b_bold, self.b_italic = self._tool("B", "Bold", True), self._tool("I", "Italic", True)
+        f = self.b_bold.font(); f.setBold(True); self.b_bold.setFont(f)
+        f = self.b_italic.font(); f.setItalic(True); self.b_italic.setFont(f)
+        self.b_bold.toggled.connect(lambda v: self.fmt_changed.emit("bold", bool(v)))
+        self.b_italic.toggled.connect(lambda v: self.fmt_changed.emit("italic", bool(v)))
+        self.b_color = self._tool("", "Text colour", False)
+        self.b_color.setIcon(_swatch_icon(self._text_color))
+        self.b_color.clicked.connect(self._pick_text_color)
+        for w in (self.b_bold, self.b_italic, self.b_color):
+            r1.addWidget(w)
+        r1.addWidget(self._sep())
+        self.b_align = {}
+        for kind, tip in (("left", "Align left"), ("center", "Align centre"), ("right", "Align right")):
+            b = self._tool("", tip + " (click again for the text's own alignment)", True)
+            b.setIcon(_align_icon(kind, T["TEXT"]))
+            b.clicked.connect(lambda _c=False, k=kind: self._align_clicked(k))
+            self.b_align[kind] = b
+            r1.addWidget(b)
+        r1.addWidget(self._sep())
+        r1.addWidget(QLabel("Line spacing"))
+        self.sp_box = QDoubleSpinBox()
+        self.sp_box.setRange(0.5, 4.0)
+        self.sp_box.setSingleStep(0.05)
+        self.sp_box.setDecimals(2)
+        self.sp_box.setValue(1.2)
+        self.sp_box.setToolTip("Space between the lines, as a multiple of the font size")
+        self.sp_box.valueChanged.connect(lambda v: self.fmt_changed.emit("spacing", float(v)))
+        r1.addWidget(self.sp_box)
+        r1.addWidget(self._sep())
+        self.b_arr = self._tool("Align lines ▾", "Line up the selected objects with each other", False)
+        m = QMenu(self.b_arr)
+        for key, label in (("left", "Left edges"), ("hcenter", "Centres (horizontal)"), ("right", "Right edges"),
+                           ("top", "Top edges"), ("vcenter", "Centres (vertical)"), ("bottom", "Bottom edges")):
+            m.addAction(label, lambda k=key: self.arrange.emit(k))
+        self.b_arr.setMenu(m)
+        self.b_arr.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        r1.addWidget(self.b_arr)
+        r1.addStretch(1)
+        col.addLayout(r1)
+
+        # ---- row 2: shapes and borders ----
+        r2 = QHBoxLayout()
+        r2.setSpacing(4)
+        r2.addWidget(QLabel("Shapes"))
+        self.b_shape = self._tool("Rectangle", "Draw a shape: click here, then drag on the page (Esc to cancel)", True)
+        self.b_shape.setIcon(_shape_icon("rect", T["TEXT"]))
+        self.b_shape.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.b_shape.toggled.connect(lambda on: self.tool_changed.emit(self._kind if on else None))
+        r2.addWidget(self.b_shape)
+        self.b_shape_menu = self._tool("▾", "Choose a shape", False)
+        sm = QMenu(self.b_shape_menu)
+        for kind, label in SHAPES:
+            a = sm.addAction(_shape_icon(kind, T["TEXT"]), label)
+            a.triggered.connect(lambda _c=False, k=kind, lb=label: self.choose_shape(k, lb))
+        self.b_shape_menu.setMenu(sm)
+        self.b_shape_menu.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        r2.addWidget(self.b_shape_menu)
+        r2.addWidget(self._sep())
+        r2.addWidget(QLabel("Line"))
+        self.b_stroke = self._tool("", "Outline colour", False)
+        self.b_stroke.setIcon(_swatch_icon(self._stroke))
+        self.b_stroke.clicked.connect(self._pick_stroke)
+        r2.addWidget(self.b_stroke)
+        self.w_box = QDoubleSpinBox()
+        self.w_box.setRange(0.25, 60)
+        self.w_box.setSingleStep(0.25)
+        self.w_box.setValue(2.0)
+        self.w_box.setSuffix(" pt")
+        self.w_box.setToolTip("Outline thickness")
+        self.w_box.valueChanged.connect(lambda v: self.shape_style_changed.emit("width", float(v)))
+        r2.addWidget(self.w_box)
+        self.dash_box = QComboBox()
+        for key, label in DASH_STYLES:
+            self.dash_box.addItem(label, key)
+        self.dash_box.setToolTip("Outline style")
+        self.dash_box.activated.connect(lambda _i: self.shape_style_changed.emit("dash", self.dash_box.currentData()))
+        r2.addWidget(self.dash_box)
+        r2.addWidget(QLabel("Fill"))
+        self.b_fill = self._tool("", "Fill colour (click the ✕ button for no fill)", False)
+        self.b_fill.setIcon(_swatch_icon(self._fill))
+        self.b_fill.clicked.connect(self._pick_fill)
+        r2.addWidget(self.b_fill)
+        self.b_nofill = self._tool("✕", "No fill", False)
+        self.b_nofill.clicked.connect(self._clear_fill)
+        r2.addWidget(self.b_nofill)
+        r2.addWidget(self._sep())
+        self.b_border = self._tool("▭ Page border…", "Add a frame around one page or all pages", False)
+        self.b_border.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.b_border.clicked.connect(self.border_requested.emit)
+        r2.addWidget(self.b_border)
+        r2.addStretch(1)
+        col.addLayout(r2)
+
+    # ---- small helpers ----
+    def _tool(self, text, tip, checkable):
+        b = QToolButton()
+        b.setText(text)
+        b.setToolTip(tip)
+        b.setCheckable(checkable)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)            # keep the keyboard focus (and the open text box) where it is
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        return b
+
+    def _sep(self):
+        s = QFrame()
+        s.setFrameShape(QFrame.Shape.VLine)
+        s.setStyleSheet(f"color:{T['LINE2']};")
+        s.setFixedHeight(20)
+        return s
+
+    def _ask_color(self, cur, title):
+        c0 = QColor(*[int(v * 255) for v in cur]) if cur else QColor("#ffcc00")
+        c = QColorDialog.getColor(c0, self.window(), title)
+        return (c.redF(), c.greenF(), c.blueF()) if c.isValid() else None
+
+    # ---- text ----
+    def _emit_family(self):
+        t = self.font_box.currentText().strip()
+        if t:
+            self.fmt_changed.emit("family", t)
+
+    def _emit_family_typed(self):
+        t = self.font_box.currentText().strip()
+        if t and any(t.lower() == f.lower() for f in font_families()):
+            self.fmt_changed.emit("family", t)
+
+    def _pick_text_color(self):
+        c = self._ask_color(self._text_color, "Text colour")
+        if c:
+            self._text_color = c
+            self.b_color.setIcon(_swatch_icon(c))
+            self.fmt_changed.emit("color", c)
+
+    def _align_clicked(self, kind):
+        on = self.b_align[kind].isChecked()
+        for k, b in self.b_align.items():
+            if k != kind:
+                b.blockSignals(True)
+                b.setChecked(False)
+                b.blockSignals(False)
+        self._align = kind if on else None
+        self.fmt_changed.emit("align", self._align)
+
+    def set_text_values(self, family, size, bold, italic, color, align, spacing):
+        """Show the properties of the selected text without announcing them as changes."""
+        for w in (self.font_box, self.size_box, self.b_bold, self.b_italic, self.sp_box, *self.b_align.values()):
+            w.blockSignals(True)
+        i = self.font_box.findText(family or "", Qt.MatchFlag.MatchFixedString) if family else -1
+        self.font_box.setCurrentIndex(i)
+        if i < 0 and family:
+            self.font_box.setEditText(family)
+        self.size_box.setValue(float(size))
+        self.b_bold.setChecked(bool(bold))
+        self.b_italic.setChecked(bool(italic))
+        self._text_color = color
+        self.b_color.setIcon(_swatch_icon(color))
+        self._align = align
+        for k, b in self.b_align.items():
+            b.setChecked(k == align)
+        if spacing:
+            self.sp_box.setValue(float(spacing))
+        for w in (self.font_box, self.size_box, self.b_bold, self.b_italic, self.sp_box, *self.b_align.values()):
+            w.blockSignals(False)
+
+    def current_text_fmt(self):
+        """Everything shown in the text row (used for brand-new text)."""
+        fam = self.font_box.currentText().strip()
+        fmt = {"size": float(self.size_box.value()), "bold": self.b_bold.isChecked(),
+               "italic": self.b_italic.isChecked(), "color": self._text_color, "spacing": float(self.sp_box.value())}
+        if fam and any(fam.lower() == f.lower() for f in font_families()):
+            fmt["family"] = fam
+        if self._align:
+            fmt["align"] = self._align
+        return fmt
+
+    # ---- shapes ----
+    def choose_shape(self, kind, label):
+        self._kind = kind
+        self.b_shape.setText(label)
+        self.b_shape.setIcon(_shape_icon(kind, T["TEXT"]))
+        if self.b_shape.isChecked():
+            self.tool_changed.emit(kind)
+        else:
+            self.b_shape.setChecked(True)
+
+    def set_tool(self, kind):
+        self.b_shape.blockSignals(True)
+        self.b_shape.setChecked(kind is not None)
+        self.b_shape.blockSignals(False)
+
+    def _pick_stroke(self):
+        c = self._ask_color(self._stroke, "Outline colour")
+        if c:
+            self._stroke = c
+            self.b_stroke.setIcon(_swatch_icon(c))
+            self.shape_style_changed.emit("stroke", c)
+
+    def _pick_fill(self):
+        c = self._ask_color(self._fill, "Fill colour")
+        if c:
+            self._fill = c
+            self.b_fill.setIcon(_swatch_icon(c))
+            self.shape_style_changed.emit("fill", c)
+
+    def _clear_fill(self):
+        self._fill = None
+        self.b_fill.setIcon(_swatch_icon(None))
+        self.shape_style_changed.emit("fill", None)
+
+    def set_shape_values(self, stroke, fill, width, dash):
+        for w in (self.w_box, self.dash_box):
+            w.blockSignals(True)
+        self._stroke, self._fill = stroke, fill
+        self.b_stroke.setIcon(_swatch_icon(stroke))
+        self.b_fill.setIcon(_swatch_icon(fill))
+        if width:
+            self.w_box.setValue(float(width))
+        i = self.dash_box.findData(dash or "solid")
+        self.dash_box.setCurrentIndex(max(0, i))
+        for w in (self.w_box, self.dash_box):
+            w.blockSignals(False)
+
+    def shape_style(self):
+        return {"stroke": self._stroke, "fill": self._fill, "width": float(self.w_box.value()),
+                "dash": self.dash_box.currentData()}
+
+
+class BorderDialog(DarkTitleBarMixin, QDialog):
+    """Frame around one page, a range of pages, or every page."""
+    def __init__(self, parent, n_pages, cur_page):
+        super().__init__(parent)
+        self.setWindowTitle("Page border")
+        self.setModal(True)
+        self.n, self.cur = n_pages, cur_page
+        self.color = (0.0, 0.0, 0.0)
+        lay = QVBoxLayout(self)
+        g = QGroupBox("Apply to")
+        gl = QVBoxLayout(g)
+        self.r_cur = QRadioButton(f"This page (page {cur_page + 1})")
+        self.r_all = QRadioButton(f"All pages ({n_pages})")
+        self.r_rng = QRadioButton("Pages:")
+        self.r_cur.setChecked(True)
+        self.rng = QLineEdit()
+        self.rng.setPlaceholderText("for example 1-3, 5, 8-")
+        self.rng.textEdited.connect(lambda _t: self.r_rng.setChecked(True))
+        rr = QHBoxLayout()
+        rr.addWidget(self.r_rng)
+        rr.addWidget(self.rng, 1)
+        gl.addWidget(self.r_cur)
+        gl.addWidget(self.r_all)
+        gl.addLayout(rr)
+        lay.addWidget(g)
+        form = QFormLayout()
+        self.b_col = QPushButton()
+        self.b_col.setIcon(_swatch_icon(self.color, 16))
+        self.b_col.setText("Colour…")
+        self.b_col.clicked.connect(self._pick)
+        form.addRow("Colour", self.b_col)
+        self.w = QDoubleSpinBox(); self.w.setRange(0.25, 40); self.w.setValue(2.0); self.w.setSingleStep(0.25); self.w.setSuffix(" pt")
+        self.m = QDoubleSpinBox(); self.m.setRange(0, 200); self.m.setValue(24); self.m.setSuffix(" pt")
+        self.rad = QDoubleSpinBox(); self.rad.setRange(0, 80); self.rad.setValue(0); self.rad.setSuffix(" pt")
+        self.st = QComboBox()
+        for key, label in (("solid", "Solid"), ("dashed", "Dashed"), ("dotted", "Dotted"), ("double", "Double")):
+            self.st.addItem(label, key)
+        form.addRow("Thickness", self.w)
+        form.addRow("Distance from the page edge", self.m)
+        form.addRow("Rounded corners", self.rad)
+        form.addRow("Style", self.st)
+        lay.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._ok)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.pages = []
+
+    def _pick(self):
+        c0 = QColor(*[int(v * 255) for v in self.color])
+        c = QColorDialog.getColor(c0, self, "Border colour")
+        if c.isValid():
+            self.color = (c.redF(), c.greenF(), c.blueF())
+            self.b_col.setIcon(_swatch_icon(self.color, 16))
+
+    def _ok(self):
+        if self.r_all.isChecked():
+            self.pages = list(range(self.n))
+        elif self.r_rng.isChecked():
+            self.pages = parse_range(self.rng.text(), self.n) or []
+            if not self.pages:
+                QMessageBox.information(self, "Page border", "Type pages like 1-3, 5, 8-")
+                return
+        else:
+            self.pages = [self.cur]
+        self.accept()
+
+    def values(self):
+        return dict(pages=self.pages, color=self.color, width=self.w.value(), margin=self.m.value(),
+                    style=self.st.currentData(), radius=self.rad.value())
 
 
 # ============================================================================
@@ -3490,6 +4376,8 @@ class DocTab(QWidget):
         self._objs = {}                                     # page index -> editable objects (text / image / drawing)
         self.edit_sel, self.edit_page = [], None            # selected objects (all on one page)
         self._drag, self._ghost, self._hover, self._editor = None, None, None, None
+        self.edit_tool = None                               # ready-made shape being drawn (None = select / move)
+        self._fonts_added = False                           # fonts were written: shrink them when saving
         self._nav, self._pending, self._frac, self._screen_off = False, False, None, None
         self._center_h = False                              # centre the page horizontally after (re)loading
 
@@ -3527,6 +4415,14 @@ class DocTab(QWidget):
         self.drop_line.setStyleSheet(f"background:{ACCENT};border-radius:2px")
         self.drop_line.hide()
 
+        self.panel = EditPanel()                            # font / alignment / shapes / borders, only while Edit is on
+        self.panel.hide()
+        self.panel.fmt_changed.connect(self._on_fmt)
+        self.panel.shape_style_changed.connect(self._on_shape_style)
+        self.panel.tool_changed.connect(self._set_tool)
+        self.panel.border_requested.connect(self._on_border)
+        self.panel.arrange.connect(self._on_arrange)
+
         split = QSplitter()
         split.setHandleWidth(4)
         split.setChildrenCollapsible(False)
@@ -3535,9 +4431,11 @@ class DocTab(QWidget):
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
         split.setSizes([self.thumbs.width(), 1100])
-        lay = QHBoxLayout(self)
+        lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(split)
+        lay.setSpacing(0)
+        lay.addWidget(self.panel)
+        lay.addWidget(split, 1)
 
     # ---------- state ----------
     def set_dirty(self, v):
@@ -3582,9 +4480,25 @@ class DocTab(QWidget):
         p, _ = QFileDialog.getSaveFileName(self.main, "Save PDF", self.path or "", "PDF (*.pdf)")
         return self._write(p) if p else False
 
+    def _pdf_bytes(self):
+        """The PDF as bytes. Fonts written by Edit are whole font files, so when fontTools is installed they are
+        cut down to the letters actually used (a copy is made first; on any problem the plain file is saved)."""
+        if self._fonts_added:
+            try:
+                import fontTools                                    # noqa: F401  (optional)
+                tmp = fitz.open("pdf", self.doc.tobytes())
+                tmp.subset_fonts()
+                data = tmp.tobytes(garbage=4, deflate=True)
+                chk = fitz.open("pdf", data)
+                if len(chk) == len(self.doc):
+                    return data
+            except Exception:
+                pass
+        return self.doc.tobytes(garbage=3, deflate=True)
+
     def _write(self, p):
         try:
-            data = self.doc.tobytes(garbage=3, deflate=True)
+            data = self._pdf_bytes()
             with open(p, "wb") as f:
                 f.write(data)
         except Exception as e:
@@ -4194,6 +5108,7 @@ class DocTab(QWidget):
         self._objs = {}
         self.edit_sel, self.edit_page = [], None
         self._drag = self._ghost = self._hover = None
+        self.edit_tool = None
         if self._editor is not None:
             ed, self._editor = self._editor, None
             ed._done = True
@@ -4202,19 +5117,142 @@ class DocTab(QWidget):
 
     def set_edit(self, on):
         self.edit_mode = on
+        self.panel.setVisible(on)
         if on:
             self._clear_armed_export()
         else:
             self._commit_editor()
             self.edit_sel, self.edit_page, self._drag, self._ghost, self._hover = [], None, None, None, None
+            self._set_tool(None)
         for lab in self.labels:
-            lab.setCursor(Qt.CursorShape.ArrowCursor)
+            lab.setCursor(Qt.CursorShape.CrossCursor if (on and self.edit_tool) else Qt.CursorShape.ArrowCursor)
             lab.export_drag_enabled = not on
             lab.setFocusPolicy(Qt.FocusPolicy.StrongFocus if on else Qt.FocusPolicy.NoFocus)
             lab.update()
 
     def on_click(self, idx, pos):                           # old click-to-edit-a-line path; Edit mode now handles input itself
         return
+
+    # -- the Edit bar --
+    def _set_tool(self, kind):
+        self.edit_tool = kind
+        self.panel.set_tool(kind)
+        if kind:
+            self.edit_sel = []
+            self._commit_editor()
+        for lab in self.labels:
+            lab.setCursor(Qt.CursorShape.CrossCursor if kind else Qt.CursorShape.ArrowCursor)
+            lab.update()
+
+    @staticmethod
+    def _first_span(line):
+        return next((s for s in line["spans"] if s["text"].strip()), line["spans"][0])
+
+    def _text_values(self, obj):
+        """Font / size / colour / alignment / line spacing of a text object, for the Edit bar."""
+        lines = obj["lines"]
+        sp = self._first_span(lines[0])
+        fam_key, bold, italic = _pdf_font_parts(sp["font"], sp["flags"])
+        _system_fonts()
+        fam = _SYS_FAMILY_NAMES.get(fam_key) or re.sub(r"^[A-Z]{6}\+", "", sp["font"] or "")
+        align, spacing = None, None
+        if len(lines) > 1:
+            bs = [fitz.Rect(l["bbox"]) for l in lines]
+            if all(abs(b.x0 - bs[0].x0) < 1.5 for b in bs):
+                align = "left"
+            elif all(abs(b.x1 - bs[0].x1) < 1.5 for b in bs):
+                align = "right"
+            elif all(abs((b.x0 + b.x1) / 2 - (bs[0].x0 + bs[0].x1) / 2) < 1.5 for b in bs):
+                align = "center"
+            step = self._first_span(lines[1])["origin"][1] - sp["origin"][1]
+            if step > 0 and sp["size"] > 0:
+                spacing = round(step / sp["size"] / 0.05) * 0.05
+        return fam, sp["size"], bool(sp["flags"] & 16), bool(sp["flags"] & 2), _rgb_from_int(sp["color"]), align, spacing
+
+    def _sel_changed(self):
+        """Show the properties of what is selected in the Edit bar."""
+        texts = [o for o in self.edit_sel if o["kind"] == "text"]
+        draws = [o for o in self.edit_sel if o["kind"] == "draw"]
+        try:
+            if texts:
+                self.panel.set_text_values(*self._text_values(texts[0]))
+            if draws and draws[0]["paths"]:
+                p = draws[0]["paths"][0]
+                d = (p.get("dashes") or "").strip()
+                self.panel.set_shape_values(p.get("color"), p.get("fill"), p.get("width") or 1.0,
+                                            "solid" if d in ("", "[] 0") else ("dotted" if d.startswith("[0") else "dashed"))
+        except Exception:
+            pass
+
+    def _on_fmt(self, key, value):
+        """A text property was changed in the Edit bar."""
+        ed = self._editor
+        if ed is not None:
+            ed.fmt[key] = value
+            lk = {"family": "family", "bold": "bold", "italic": "italic", "color": "color", "align": "align",
+                  "spacing": "spacing"}
+            if key == "size":
+                ed.set_look(px=max(8, value * self.zoom))
+            elif key in lk:
+                ed.set_look(**{lk[key]: value})
+            return
+        if value is None or self.edit_page is None:
+            return
+        if any(o["kind"] == "text" for o in self.edit_sel):
+            self._restyle_text(self.edit_page, {key: value})
+
+    def _on_shape_style(self, key, value):
+        if self.edit_tool or self.edit_page is None:
+            return
+        if any(o["kind"] == "draw" for o in self.edit_sel):
+            ov = {"stroke": "color", "fill": "fill", "width": "width", "dash": "dash"}[key]
+            self._restyle_shapes(self.edit_page, {ov: value})
+
+    def _on_border(self):
+        if not self.doc:
+            return
+        dlg = BorderDialog(self.main, len(self.doc), self.cur)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        self.snapshot()
+        try:
+            for i in v["pages"]:
+                _draw_border(self.doc[i], v["color"], v["width"], v["margin"], v["style"], v["radius"])
+        except Exception as e:
+            QMessageBox.warning(self.main, "Border failed", str(e))
+        self._objs = {}
+        for i in v["pages"]:
+            self.render_page(i, force=True)
+            self.thumbs.item(i).setIcon(self.thumb_icon(i))
+        self.thumbs.viewport().update()
+        for lab in self.labels:
+            lab.update()
+
+    def _on_arrange(self, mode):
+        objs = list(self.edit_sel)
+        if len(objs) < 2 or self.edit_page is None:
+            QMessageBox.information(self.main, "PDF Studio", "Select two or more objects (Shift+click, or drag a box around them) first.")
+            return
+        u = self._sel_rect()
+        items = []
+        for o in objs:
+            r, dx, dy = o["rect"], 0.0, 0.0
+            if mode == "left":
+                dx = u.x0 - r.x0
+            elif mode == "right":
+                dx = u.x1 - r.x1
+            elif mode == "hcenter":
+                dx = (u.x0 + u.x1) / 2 - (r.x0 + r.x1) / 2
+            elif mode == "top":
+                dy = u.y0 - r.y0
+            elif mode == "bottom":
+                dy = u.y1 - r.y1
+            else:
+                dy = (u.y0 + u.y1) / 2 - (r.y0 + r.y1) / 2
+            items.append((o, (0.0, 0.0), 1.0, 1.0, dx, dy))
+        if any(abs(it[4]) > 1e-3 or abs(it[5]) > 1e-3 for it in items):
+            self._transform_each(self.edit_page, items)
 
     # -- finding the objects on a page --
     def page_objects(self, idx):
@@ -4243,13 +5281,19 @@ class DocTab(QWidget):
             pass
         try:
             paths = [p for p in page.get_drawings() if p.get("type") in ("f", "s", "fs") and p.get("items")]
-            if paths:
-                clusters = page.cluster_drawings(drawings=paths)
-                pr = page.rect
-                for c in clusters:
-                    if c.width * c.height >= 0.85 * pr.width * pr.height:
-                        continue                            # the page background, not an object
-                    mine = [p for p in paths if (fitz.Rect(c) + (-1, -1, 1, 1)).contains(p["rect"])]
+            pr = page.rect
+            parea = max(1.0, pr.width * pr.height)
+            big = [p for p in paths if p["rect"].width * p["rect"].height >= 0.5 * parea]
+            small = [p for p in paths if p not in big]
+            for p in big:                                   # page-sized frames: kept apart so they don't swallow everything
+                rr = fitz.Rect(p["rect"])
+                if p.get("fill") is None:
+                    objs.append({"kind": "draw", "rect": rr, "paths": [p], "hollow": True})
+                elif rr.width * rr.height < 0.85 * parea:
+                    objs.append({"kind": "draw", "rect": rr, "paths": [p]})   # (bigger than that = the page background)
+            if small:
+                for c in page.cluster_drawings(drawings=small):
+                    mine = [p for p in small if (fitz.Rect(c) + (-1, -1, 1, 1)).contains(p["rect"])]
                     if mine:
                         objs.append({"kind": "draw", "rect": fitz.Rect(c), "paths": mine})
         except Exception:
@@ -4261,10 +5305,16 @@ class DocTab(QWidget):
         tol = 3.0 / self.zoom
         best, best_area = None, None
         for o in self.page_objects(idx):
-            if (o["rect"] + (-tol, -tol, tol, tol)).contains(pt):
-                area = max(1.0, o["rect"].width * o["rect"].height) * (0.5 if o["kind"] == "text" else 1.0)
-                if best is None or area < best_area:
-                    best, best_area = o, area
+            r = o["rect"]
+            if not (r + (-tol, -tol, tol, tol)).contains(pt):
+                continue
+            if o.get("hollow"):                             # an empty frame is only grabbed by its outline
+                inner = r + (tol * 2, tol * 2, -tol * 2, -tol * 2)
+                if inner.x1 > inner.x0 and inner.y1 > inner.y0 and inner.contains(pt):
+                    continue
+            area = max(1.0, r.width * r.height) * (0.5 if o["kind"] == "text" else 1.0)
+            if best is None or area < best_area:
+                best, best_area = o, area
         return best
 
     def _sel_rect(self):
@@ -4300,6 +5350,39 @@ class DocTab(QWidget):
             return False
         return True
 
+    # -- drawing a ready-made shape --
+    def _shape_box(self, kind, start, cur, shift):
+        dx, dy = cur.x - start.x, cur.y - start.y
+        if kind in LINE_SHAPES:
+            if shift:                                       # snap to 0 / 45 / 90 degrees
+                ang = round(math.atan2(dy, dx) / (math.pi / 4)) * (math.pi / 4)
+                ln = math.hypot(dx, dy)
+                dx, dy = ln * math.cos(ang), ln * math.sin(ang)
+        elif kind in SQUARE_SHAPES or shift:
+            side = max(abs(dx), abs(dy))
+            dx, dy = math.copysign(side, dx or 1), math.copysign(side, dy or 1)
+        return start.x, start.y, start.x + dx, start.y + dy
+
+    def _paint_shape_preview(self, p, d):
+        z = self.zoom
+        x0, y0, x1, y1 = self._shape_box(d["kind"], d["start"], d["cur"], d["shift"])
+        st = self.panel.shape_style()
+        out, solid = _shape_qpath(d["kind"], x0 * z, y0 * z, x1 * z, y1 * z, st["width"] * z)
+        stroke = QColor(*[int(c * 255) for c in st["stroke"]]) if st["stroke"] else None
+        fill = QColor(*[int(c * 255) for c in st["fill"]]) if st["fill"] else None
+        pen = QPen(stroke, max(1.0, st["width"] * z)) if stroke else QPen(Qt.PenStyle.NoPen)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        if st["dash"] == "dashed":
+            pen.setStyle(Qt.PenStyle.DashLine)
+        elif st["dash"] == "dotted":
+            pen.setStyle(Qt.PenStyle.DotLine)
+        p.setPen(pen)
+        p.setBrush(fill if (fill and d["kind"] not in LINE_SHAPES) else Qt.BrushStyle.NoBrush)
+        p.drawPath(out)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(stroke or QColor(0, 0, 0))
+        p.drawPath(solid)
+
     # -- mouse --
     def edit_press(self, lab, pos, mods):
         idx = lab.index
@@ -4307,6 +5390,14 @@ class DocTab(QWidget):
         if not self._page_ok(idx):
             return
         pt = fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom)
+        if self.edit_tool:                                  # drawing a ready-made shape
+            self.edit_page, self.edit_sel = idx, []
+            self._drag = {"mode": "shape", "idx": idx, "kind": self.edit_tool, "start": pt, "cur": pt,
+                          "shift": bool(mods & Qt.KeyboardModifier.ShiftModifier)}
+            self._ghost = None
+            for l in self.labels:
+                l.update()
+            return
         h = self._handle_at(idx, pos)
         if h:
             r = self._sel_rect()
@@ -4334,14 +5425,24 @@ class DocTab(QWidget):
             self.edit_page = idx
             self._drag = {"mode": "band", "start": pos, "idx": idx}
             self._band = QRectF(pos, pos)
+        self._sel_changed()
         for l in self.labels:
             l.update()
 
     def edit_move(self, lab, pos, buttons, mods):
         idx = lab.index
         d = self._drag
+        if d is not None and d["mode"] == "shape":
+            if (buttons & Qt.MouseButton.LeftButton) and d["idx"] == idx:
+                d["cur"] = fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom)
+                d["shift"] = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+                lab.update()
+            return
         if d is None or not (buttons & Qt.MouseButton.LeftButton) or d["idx"] != idx:
             if d is None:                                   # hover feedback
+                if self.edit_tool:
+                    lab.setCursor(Qt.CursorShape.CrossCursor)
+                    return
                 h = self._handle_at(idx, pos)
                 if h:
                     lab.setCursor(self._HANDLE_CURSORS[h])
@@ -4393,6 +5494,20 @@ class DocTab(QWidget):
         if d is None:
             return
         idx = d["idx"]
+        if d["mode"] == "shape":
+            kind = d["kind"]
+            x0, y0, x1, y1 = self._shape_box(kind, d["start"], d["cur"], d["shift"])
+            if math.hypot(x1 - x0, y1 - y0) < 4:            # a plain click drops a default-sized shape
+                sx, sy = d["start"].x, d["start"].y
+                if kind in LINE_SHAPES:
+                    x0, y0, x1, y1 = sx, sy, sx + 120, sy
+                elif kind in SQUARE_SHAPES:
+                    x0, y0, x1, y1 = sx, sy, sx + 80, sy + 80
+                else:
+                    x0, y0, x1, y1 = sx, sy, sx + 110, sy + 76
+            self._apply_new_shape(idx, kind, x0, y0, x1, y1)
+            self._set_tool(None)
+            return
         if d["mode"] == "band":
             b = self._band
             self._band = None
@@ -4400,6 +5515,7 @@ class DocTab(QWidget):
                 rect = fitz.Rect(b.left() / self.zoom, b.top() / self.zoom, b.right() / self.zoom, b.bottom() / self.zoom)
                 add = [o for o in self.page_objects(idx) if rect.contains(o["rect"]) and o not in self.edit_sel]
                 self.edit_sel = self.edit_sel + add if (mods & Qt.KeyboardModifier.ShiftModifier) else add
+            self._sel_changed()
         elif g is not None and (abs(g[0] - 1) > 1e-4 or abs(g[1] - 1) > 1e-4 or abs(g[2]) > 1e-4 or abs(g[3]) > 1e-4):
             if d["mode"] == "resize":
                 self._apply_transform(idx, d["anchor"], g[0], g[1], 0.0, 0.0)
@@ -4414,12 +5530,13 @@ class DocTab(QWidget):
 
     def edit_double_click(self, lab, pos):
         idx = lab.index
-        if not self._page_ok(idx):
+        if self.edit_tool or not self._page_ok(idx):
             return
         pt = fitz.Point(pos.x() / self.zoom, pos.y() / self.zoom)
         o = self._hit(idx, pt)
         if o is not None and o["kind"] == "text":
             self.edit_page, self.edit_sel = idx, [o]
+            self._sel_changed()
             self._open_editor(lab, o)
         elif o is None:
             self.edit_page, self.edit_sel = idx, []
@@ -4431,6 +5548,9 @@ class DocTab(QWidget):
         if self._editor is not None:
             return False
         if k == Qt.Key.Key_Escape:
+            if self.edit_tool:
+                self._drag = None
+                self._set_tool(None)
             self.edit_sel = []
             lab.update()
             return True
@@ -4462,6 +5582,10 @@ class DocTab(QWidget):
     def paint_overlay(self, lab, p):
         idx, z = lab.index, self.zoom
         accent = QColor(ACCENT)
+        d = self._drag
+        if d is not None and d["mode"] == "shape" and d["idx"] == idx:
+            self._paint_shape_preview(p, d)
+            return
         if self._hover is not None and self._hover in self.page_objects(idx) and self._hover not in self.edit_sel and self._drag is None:
             r = self._hover["rect"]
             p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 150), 1))
@@ -4481,7 +5605,7 @@ class DocTab(QWidget):
             r0 = o["rect"]
             r = self._tx_rect(r0, g, anchor)
             tgt = QRectF(r.x0 * z, r.y0 * z, r.width * z, r.height * z)
-            if moving and img is not None:                  # live ghost of the content being moved / scaled
+            if moving and img is not None and not o.get("hollow"):   # live ghost of the content being moved / scaled
                 p.setOpacity(0.8)
                 p.drawImage(tgt, img, QRectF(r0.x0 * z, r0.y0 * z, r0.width * z, r0.height * z))
                 p.setOpacity(1.0)
@@ -4504,15 +5628,20 @@ class DocTab(QWidget):
         if obj is not None:
             lines = obj["lines"]
             text = "\n".join("".join(sp["text"] for sp in ln["spans"]) for ln in lines)
-            size = lines[0]["spans"][0]["size"]
+            fam, size, bold, italic, color, align, spacing = self._text_values(obj)
             r = obj["rect"]
             x, y, w, h = r.x0 * z - 2, r.y0 * z - 2, r.width * z + 60, r.height * z + 6
         else:
-            text, size = "", 12.0
+            fmt = self.panel.current_text_fmt()
+            text, size = "", fmt.get("size", 12.0)
+            fam, bold, italic = fmt.get("family"), fmt.get("bold"), fmt.get("italic")
+            color, align, spacing = fmt.get("color", (0, 0, 0)), fmt.get("align"), fmt.get("spacing")
             x, y, w, h = pt.x * z, (pt.y - size) * z, 220, size * z * 1.8
-        ed = InlineTextEditor(lab, text, size * z, w, h)
+        look = {"family": fam, "px": size * z, "bold": bold, "italic": italic, "color": color, "align": align,
+                "spacing": spacing}
+        ed = InlineTextEditor(lab, text, w, h, look, keep=self.panel)
         ed.move(int(x), int(y))
-        ed.committed.connect(lambda t, o=obj, p0=pt, i=lab.index: self._editor_done(i, o, p0, t))
+        ed.committed.connect(lambda t, o=obj, p0=pt, i=lab.index, e=ed: self._editor_done(i, o, p0, t, dict(e.fmt)))
         ed.cancelled.connect(lambda: self._editor_closed())
         self._editor = ed
         ed.show()
@@ -4531,16 +5660,16 @@ class DocTab(QWidget):
             ed.hide()
             ed.deleteLater()
 
-    def _editor_done(self, idx, obj, pt, text):
+    def _editor_done(self, idx, obj, pt, text, fmt):
         self._editor_closed()
         try:
             if obj is None:
                 if text.strip():
-                    self._apply_new_text(idx, pt, text)
+                    self._apply_new_text(idx, pt, text, self.panel.current_text_fmt())
             else:
                 old = "\n".join("".join(sp["text"] for sp in ln["spans"]) for ln in obj["lines"])
-                if text != old:
-                    self._apply_text_edit(idx, obj, text)
+                if text != old or fmt:
+                    self._apply_text_edit(idx, obj, text, fmt)
         except Exception as e:
             QMessageBox.warning(self.main, "Edit failed", str(e))
 
@@ -4554,12 +5683,22 @@ class DocTab(QWidget):
         self.edit_page = idx
         self.edit_sel = []
         if select_rects:
-            for o in self.page_objects(idx):
-                for rr in select_rects:
-                    if (abs(o["rect"].x0 - rr.x0) < 4 and abs(o["rect"].y0 - rr.y0) < 4
-                            and abs(o["rect"].x1 - rr.x1) < 6 and abs(o["rect"].y1 - rr.y1) < 6):
+            for rr in select_rects:
+                best, best_iou, inside = None, 0.25, []
+                for o in self.page_objects(idx):
+                    inter = fitz.Rect(o["rect"]) & rr
+                    if inter.is_empty:
+                        continue
+                    ia, oa = inter.width * inter.height, max(1e-6, o["rect"].width * o["rect"].height)
+                    if o["kind"] == "text" and ia / oa > 0.6:
+                        inside.append(o)                        # a text block that MuPDF split into several pieces
+                    iou = ia / max(1e-6, oa + rr.width * rr.height - ia)
+                    if iou > best_iou:
+                        best, best_iou = o, iou
+                for o in inside + ([best] if best is not None else []):
+                    if o not in self.edit_sel:
                         self.edit_sel.append(o)
-                        break
+        self._sel_changed()
         self.labels[idx].update()
 
     def _remove_objects(self, page, objs):
@@ -4577,10 +5716,8 @@ class DocTab(QWidget):
                     page.add_redact_annot(o["rect"], fill=False)
                     _apply_redactions(page, images=getattr(fitz, "PDF_REDACT_IMAGE_REMOVE", 1))
         draws = [o for o in objs if o["kind"] == "draw"]
-        for o in draws:
-            page.add_redact_annot(o["rect"] + (0.4, 0.4, -0.4, -0.4), fill=False)
-        if draws:                                           # "if touched": curves (circles ...) are not removed by "if covered"
-            _apply_redactions(page, graphics=getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED", 2))
+        if draws:
+            _remove_draws(page, draws)
 
     def _image_payload(self, o):
         info = self.doc.extract_image(o["xref"])
@@ -4594,45 +5731,176 @@ class DocTab(QWidget):
                 mask = None
         return info["image"], mask
 
-    def _apply_transform(self, idx, anchor, sx, sy, dx, dy):
-        objs = list(self.edit_sel)
-        if not objs:
+    @staticmethod
+    def _style_of(span, fmt=None):
+        """Font / size / colour of a text span, with the changes made in the Edit bar on top."""
+        flags = span["flags"]
+        st = {"font": span["font"], "family": None, "size": span["size"], "color": _rgb_from_int(span["color"])}
+        fmt = fmt or {}
+        if "bold" in fmt:
+            flags = (flags | 16) if fmt["bold"] else (flags & ~16)
+        if "italic" in fmt:
+            flags = (flags | 2) if fmt["italic"] else (flags & ~2)
+        st["flags"] = flags
+        if fmt.get("family"):
+            st["family"] = fmt["family"]
+        if fmt.get("size"):
+            st["size"] = float(fmt["size"])
+        if fmt.get("color"):
+            st["color"] = fmt["color"]
+        return st
+
+    def _layout_text(self, page, obj, texts, fmt, cache, same_text=False):
+        """Write a text object's lines again with the given text and format. Returns the area it now covers."""
+        self._fonts_added = True
+        lines, R = obj["lines"], fitz.Rect(obj["rect"])
+        firsts = [self._first_span(l) for l in lines]
+        n = len(texts)
+        spacing, align = fmt.get("spacing"), fmt.get("align")
+        ratio = 1.2
+        if len(lines) > 1 and firsts[0]["size"] > 0:
+            ratio = (firsts[1]["origin"][1] - firsts[0]["origin"][1]) / firsts[0]["size"]
+            if ratio < 0.3:
+                ratio = 1.2
+        ratio = max(0.5, min(4.0, spacing if spacing else ratio))
+        keep_y = not spacing and n == len(lines)
+        styles = [self._style_of(firsts[min(i, len(firsts) - 1)], fmt) for i in range(n)]
+        ys, y = [], firsts[0]["origin"][1]
+        for i in range(n):
+            if keep_y:
+                y = firsts[i]["origin"][1]
+            elif i > 0:
+                y += ratio * styles[i]["size"]
+            ys.append(y)
+        used = None
+
+        def grow(x0, x1, yb, size):
+            nonlocal used
+            rc = fitz.Rect(x0, yb - size, x1, yb + size * 0.3)
+            used = rc if used is None else (used | rc)
+
+        if same_text and set(fmt) <= {"align", "spacing"}:  # only alignment / spacing: move the original spans, keep their looks
+            for i, ln in enumerate(lines):
+                lb = fitz.Rect(ln["bbox"])
+                dx = 0.0
+                if align == "left":
+                    dx = R.x0 - lb.x0
+                elif align == "right":
+                    dx = R.x1 - lb.x1
+                elif align == "center":
+                    dx = (R.x0 + R.x1) / 2 - (lb.x0 + lb.x1) / 2
+                dy = ys[i] - firsts[i]["origin"][1]
+                for sp in ln["spans"]:
+                    if not sp["text"].strip():
+                        continue
+                    bb = fitz.Rect(sp["bbox"])
+                    st = self._style_of(sp)
+                    if _RTL_RE.search(sp["text"]):
+                        _emit_text(page, sp["text"], sp["origin"][1] + dy, st, "right", bb.x0 + dx, bb.x1 + dx, cache)
+                    else:
+                        _emit_text(page, sp["text"], sp["origin"][1] + dy, st, "left", sp["origin"][0] + dx, bb.x1 + dx, cache)
+                grow(lb.x0 + dx, lb.x1 + dx, ys[i], firsts[i]["size"])
+            return used
+        for i, t in enumerate(texts):
+            if not t.strip():
+                continue
+            st, rtl = styles[i], bool(_RTL_RE.search(t))
+            w = _text_width(page, t, st, cache) * (0.8 if rtl else 1.0)
+            if align in ("left", "center", "right"):
+                a, x0, x1 = align, R.x0, R.x1
+            else:                                           # keep each line where it was
+                ob = fitz.Rect(lines[min(i, len(lines) - 1)]["bbox"])
+                a, x0, x1 = ("right" if rtl else "left"), ob.x0, ob.x1
+            _emit_text(page, t, ys[i], st, a, x0, x1, cache)
+            if a == "right":
+                grow(x1 - w, x1, ys[i], st["size"])
+            elif a == "center":
+                grow((x0 + x1) / 2 - w / 2, (x0 + x1) / 2 + w / 2, ys[i], st["size"])
+            else:
+                grow(x0, x0 + w, ys[i], st["size"])
+        return used
+
+    def _transform_each(self, idx, items, ov=None):
+        """Move / scale objects. items = [(object, anchor, sx, sy, dx, dy)], ov = new look for the vector shapes."""
+        if not items:
             return
-        ax, ay = anchor
-        T = lambda p: fitz.Point(ax + (p.x - ax) * sx + dx, ay + (p.y - ay) * sy + dy)
-        if abs(sx - 1) < 1e-6:
-            s_text = sy
-        elif abs(sy - 1) < 1e-6:
-            s_text = sx
-        else:
-            s_text = (sx + sy) / 2
-        avg = (abs(sx) + abs(sy)) / 2
         page = self.doc[idx]
         self.snapshot()
-        new_rects = [self._tx_rect(o["rect"], (sx, sy, dx, dy), anchor) for o in objs]
+        objs = [it[0] for it in items]
+        cache = {}
+        new_rects = []
         try:
             payloads = {o["xref"]: self._image_payload(o) for o in objs if o["kind"] == "image"}
             self._remove_objects(page, objs)
-            for o, nr in zip(objs, new_rects):
+            for o, anchor, sx, sy, dx, dy in items:
+                ax, ay = anchor
+                T = lambda p, ax=ax, ay=ay, sx=sx, sy=sy, dx=dx, dy=dy: fitz.Point(ax + (p.x - ax) * sx + dx, ay + (p.y - ay) * sy + dy)
+                if abs(sx - 1) < 1e-6:
+                    s_text = sy
+                elif abs(sy - 1) < 1e-6:
+                    s_text = sx
+                else:
+                    s_text = (sx + sy) / 2
+                avg = (abs(sx) + abs(sy)) / 2
+                nr = self._tx_rect(o["rect"], (sx, sy, dx, dy), anchor)
+                new_rects.append(nr)
                 if o["kind"] == "text":
                     for ln in o["lines"]:
                         for sp in ln["spans"]:
                             if not sp["text"].strip():
                                 continue
+                            self._fonts_added = True
                             bb = fitz.Rect(sp["bbox"])
                             nb = fitz.Rect(T(bb.tl), T(bb.br))
-                            _emit_text(page, sp["text"], T(fitz.Point(sp["origin"])), sp["size"] * s_text,
-                                       sp["flags"], _rgb_from_int(sp["color"]), nb)
+                            st = self._style_of(sp)
+                            st["size"] = sp["size"] * s_text
+                            org = T(fitz.Point(sp["origin"]))
+                            if _RTL_RE.search(sp["text"]):
+                                _emit_text(page, sp["text"], org.y, st, "right", nb.x0, nb.x1, cache)
+                            else:
+                                _emit_text(page, sp["text"], org.y, st, "left", org.x, nb.x1, cache)
                 elif o["kind"] == "image":
                     pl = payloads.get(o["xref"])
                     if pl:
                         page.insert_image(nr, stream=pl[0], mask=pl[1], keep_proportion=False)
                 else:
                     for path in o["paths"]:
-                        _redraw_path(page, path, T, avg)
+                        _redraw_path(page, path, T, avg, ov)
         except Exception as e:
             QMessageBox.warning(self.main, "Edit failed", str(e))
         self._finish_edit(idx, new_rects)
+
+    def _apply_transform(self, idx, anchor, sx, sy, dx, dy):
+        self._transform_each(idx, [(o, anchor, sx, sy, dx, dy) for o in self.edit_sel])
+
+    def _restyle_shapes(self, idx, ov):
+        draws = [o for o in self.edit_sel if o["kind"] == "draw"]
+        self._transform_each(idx, [(o, (0.0, 0.0), 1.0, 1.0, 0.0, 0.0) for o in draws], ov)
+
+    def _restyle_text(self, idx, fmt):
+        objs = [o for o in self.edit_sel if o["kind"] == "text"]
+        if not objs:
+            return
+        page = self.doc[idx]
+        self.snapshot()
+        rects, cache = [], {}
+        try:
+            self._remove_objects(page, objs)
+            groups = [o for o in objs]
+            if len(objs) > 1 and set(fmt) <= {"align", "spacing"}:     # several pieces: line them up as one block
+                lines = sorted((ln for o in objs for ln in o["lines"]), key=lambda l: self._first_span(l)["origin"][1])
+                r = fitz.Rect(objs[0]["rect"])
+                for o in objs[1:]:
+                    r |= o["rect"]
+                groups = [{"kind": "text", "rect": r, "lines": lines}]
+            for o in groups:
+                texts = ["".join(sp["text"] for sp in ln["spans"]) for ln in o["lines"]]
+                r = self._layout_text(page, o, texts, fmt, cache, same_text=True)
+                if r is not None:
+                    rects.append(r)
+        except Exception as e:
+            QMessageBox.warning(self.main, "Edit failed", str(e))
+        self._finish_edit(idx, rects)
 
     def _apply_delete(self, idx):
         objs = list(self.edit_sel)
@@ -4645,35 +5913,49 @@ class DocTab(QWidget):
             QMessageBox.warning(self.main, "Edit failed", str(e))
         self._finish_edit(idx)
 
-    def _apply_text_edit(self, idx, obj, text):
+    def _apply_text_edit(self, idx, obj, text, fmt=None):
         page = self.doc[idx]
         self.snapshot()
-        lines = obj["lines"]
-        sp0 = lines[0]["spans"][0]
-        size, flags, color = sp0["size"], sp0["flags"], _rgb_from_int(sp0["color"])
-        ox, oy = sp0["origin"]
-        step = (lines[1]["spans"][0]["origin"][1] - oy) if len(lines) > 1 else size * 1.2
-        if step <= 0:
-            step = size * 1.2
-        r = obj["rect"]
         self._remove_objects(page, [obj])
-        new_rects = []
-        for i, t in enumerate(text.split("\n")):
-            if t.strip():
-                y = oy + i * step
-                _emit_text(page, t, fitz.Point(ox, y), size, flags, color,
-                           fitz.Rect(r.x0, y - size, r.x1, y + size * 0.4))
-        self._finish_edit(idx)
+        old = [("".join(sp["text"] for sp in ln["spans"])) for ln in obj["lines"]]
+        new = text.split("\n")
+        r = self._layout_text(page, obj, new, fmt or {}, {}, same_text=(new == old))
+        self._finish_edit(idx, [r] if r is not None else None)
 
-    def _apply_new_text(self, idx, pt, text):
+    def _apply_new_text(self, idx, pt, text, fmt):
         page = self.doc[idx]
         self.snapshot()
-        size = 12.0
-        for i, t in enumerate(text.split("\n")):
+        self._fonts_added = True
+        cache = {}
+        flags = (16 if fmt.get("bold") else 0) | (2 if fmt.get("italic") else 0)
+        st = {"font": "Helvetica", "family": fmt.get("family") or "Arial", "flags": flags,
+              "size": float(fmt.get("size") or 12.0), "color": fmt.get("color") or (0, 0, 0)}
+        if not fmt.get("family"):                           # no font picked: the standard sans font keeps the file small
+            st["family"] = None
+        lines = text.split("\n")
+        ratio = float(fmt.get("spacing") or 1.2)
+        widths = [_text_width(page, t, st, cache) * (0.8 if _RTL_RE.search(t) else 1.0) for t in lines]
+        wmax = max(widths + [1.0])
+        align = fmt.get("align") or "left"
+        used = None
+        for i, t in enumerate(lines):
             if t.strip():
-                y = pt.y + i * size * 1.2
-                _emit_text(page, t, fitz.Point(pt.x, y), size, 0, (0, 0, 0))
-        self._finish_edit(idx)
+                y = pt.y + i * st["size"] * ratio
+                _emit_text(page, t, y, st, align, pt.x, pt.x + wmax, cache)
+                rc = fitz.Rect(pt.x, y - st["size"], pt.x + wmax, y + st["size"] * 0.3)
+                used = rc if used is None else (used | rc)
+        self._finish_edit(idx, [used] if used is not None else None)
+
+    def _apply_new_shape(self, idx, kind, x0, y0, x1, y1):
+        st = self.panel.shape_style()
+        page = self.doc[idx]
+        self.snapshot()
+        try:
+            _draw_shape_pdf(page, kind, x0, y0, x1, y1, st["stroke"], st["fill"], st["width"], st["dash"])
+        except Exception as e:
+            QMessageBox.warning(self.main, "Shape failed", str(e))
+        h = st["width"] / 2
+        self._finish_edit(idx, [fitz.Rect(min(x0, x1) - h, min(y0, y1) - h, max(x0, x1) + h, max(y0, y1) + h)])
 
 
 # ============================================================================
