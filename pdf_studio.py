@@ -595,6 +595,8 @@ _THEMES = {
         SELECTION="#2F5C9E", TRACK="#444444", TIP_BG="#3A3A3A", TIP_BORDER="#5A5A5A", MENU_SEL_TEXT="#FFFFFF",
         CHECK_COL="#E6E6E6", ARROW="#CFCFCF",
         ACC="#2680EB", ACC_HOVER="#4B9CF5", ACC_PRESS="#1473E6", DRAG="#378EF0",
+        BODY="#262626", BODY_PANEL="#2B2B2B", BODY_TEXT="#BDBDBD", BODY_HOVER="#3E3E3E",
+        BODY_SB_TRACK="#2B2B2B", BODY_SB_HANDLE="#5A5A5A", BODY_SB_HANDLE_H="#7C7C7C",
         RIM=(255, 255, 255, 38), THUMB_RIM=(255, 255, 255, 70), DARK=True),
     "light": dict(
         BG="#F4F4F4", SURFACE="#FFFFFF", STRIP="#EBEBEB", CANVAS="#E4E4E4", PANEL="#F4F4F4",
@@ -607,6 +609,8 @@ _THEMES = {
         SELECTION="#B7D4F9", TRACK="#E1E1E1", TIP_BG="#FFFFFF", TIP_BORDER="#8E8E8E", MENU_SEL_TEXT="#000000",
         CHECK_COL="#2C2C2C", ARROW="#4B4B4B",
         ACC="#1473E6", ACC_HOVER="#0D66D0", ACC_PRESS="#095ABA", DRAG="#1473E6",
+        BODY="#4A4A4A", BODY_PANEL="#3B3B3B", BODY_TEXT="#D4D4D4", BODY_HOVER="#4A4A4A",   # dark-grey body (viewer + thumbnails)
+        BODY_SB_TRACK="#3B3B3B", BODY_SB_HANDLE="#6E6E6E", BODY_SB_HANDLE_H="#8C8C8C",
         RIM=(0, 0, 0, 60), THUMB_RIM=(0, 0, 0, 70), DARK=False),
 }
 # light is the default; start with  python pdf_studio.py --dark  for the dark theme
@@ -713,12 +717,18 @@ QStatusBar::item { border:none; }
 QLabel#StatusPill { background:transparent; border:none; padding:3px 12px; color:$TEXT; }
 
 /* ---------- panels ---------- */
-QListWidget#Thumbs { background:$PANEL; border:none; padding:6px 4px; color:$TEXT; outline:0; }
-QListWidget#Thumbs::item { border-radius:3px; color:$TEXT2; }
-QListWidget#Thumbs::item:hover { background:$HOVER; }
+QListWidget#Thumbs { background:$BODY_PANEL; border:none; padding:6px 4px; color:$BODY_TEXT; outline:0; }
+QListWidget#Thumbs::item { border-radius:3px; color:$BODY_TEXT; }
+QListWidget#Thumbs::item:hover { background:$BODY_HOVER; }
 QListWidget#Thumbs::item:selected { background:$SEL; color:$SEL_TEXT; }
 QListWidget#Thumbs::item:selected:!active { background:$SEL; color:$SEL_TEXT; }
-QScrollArea#PageScroll { background:$CANVAS; border:none; }
+QScrollArea#PageScroll { background:$BODY; border:none; }
+QListWidget#Thumbs QScrollBar:vertical, QScrollArea#PageScroll QScrollBar:vertical,
+QScrollArea#PageScroll QScrollBar:horizontal { background:$BODY_SB_TRACK; }
+QListWidget#Thumbs QScrollBar::handle:vertical, QScrollArea#PageScroll QScrollBar::handle:vertical,
+QScrollArea#PageScroll QScrollBar::handle:horizontal { background:$BODY_SB_HANDLE; }
+QListWidget#Thumbs QScrollBar::handle:vertical:hover, QScrollArea#PageScroll QScrollBar::handle:vertical:hover,
+QScrollArea#PageScroll QScrollBar::handle:horizontal:hover { background:$BODY_SB_HANDLE_H; }
 QScrollArea#PageScroll > QWidget > QWidget { background:transparent; }
 QSplitter::handle { background:$LINE; }
 QSplitter::handle:hover { background:$LINE2; }
