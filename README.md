@@ -35,7 +35,7 @@ To build locally:
 
 ```
 pip install -r requirements.txt pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name PDFStudio pdf_studio.py
+pyinstaller --noconfirm --onefile --windowed --noupx --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --name PDFStudio pdf_studio.py
 ```
 
 ## Requirements

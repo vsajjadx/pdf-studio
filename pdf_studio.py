@@ -21,6 +21,12 @@ Icon file:      python pdf_studio.py --export-icon pdfstudio.ico   (used for the
 """
 import sys, os, re, time, glob, tempfile, math, bisect, string, html as _html, shutil
 
+# PyMuPDF loads its optional page-layout analyser (onnxruntime + numpy) on import when it is installed. PDF Studio
+# never uses it, and it costs about half a second on every start, so keep it out. Must run before `import pymupdf`.
+os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
+sys.modules.setdefault("pymupdf.layout", None)
+sys.modules.setdefault("pymupdf4llm", None)         # markdown export helper (pulls in numpy); also unused
+
 SERVER_NAME = "PDFStudio_single_instance_" + re.sub(r"\W", "_", os.environ.get("USERNAME", os.environ.get("USER", "u")))
 APP_USER_MODEL_ID = "PDFStudio.PDFStudio.1"     # Windows taskbar identity (own icon + own button group)
 
@@ -3737,16 +3743,40 @@ class Main(DarkTitleBarMixin, QMainWindow):
 
     # ---------- single instance ----------
     def bring_to_front(self):
-        """Restore (if minimized) and focus this window, as Acrobat does when you open another PDF."""
+        """Restore (if minimized) and put this window on top of every other window and give it focus, as
+        Acrobat does when you open another PDF. Windows only lets the foreground process take focus, so we
+        join the foreground thread's input queue and use the topmost toggle as a fallback."""
         self.setWindowState((self.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
         self.show()
         self.raise_()
         self.activateWindow()
-        if sys.platform == "win32":
+        if sys.platform != "win32":
+            return
+        try:
+            from ctypes import wintypes
+            user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            hwnd = int(self.winId())
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)                              # SW_RESTORE
+            this_thread = kernel32.GetCurrentThreadId()
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            attached = bool(fg_thread and fg_thread != this_thread
+                            and user32.AttachThreadInput(this_thread, fg_thread, True))
             try:
-                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
-            except Exception:
-                pass
+                flags = 0x0001 | 0x0002 | 0x0040                         # NOSIZE | NOMOVE | SHOWWINDOW
+                user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, flags)         # HWND_TOPMOST: above every window now
+                user32.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, flags)         # HWND_NOTOPMOST: back to a normal window
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+                user32.SetFocus(hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(this_thread, fg_thread, False)
+        except Exception:
+            pass
 
     def attach_server(self, server):
         self.server = server
@@ -3895,6 +3925,11 @@ class Main(DarkTitleBarMixin, QMainWindow):
 #  SINGLE INSTANCE: a second launch hands its files to the running window (-> new tabs)
 # ============================================================================
 def _forward(paths):
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)   # ASFW_ANY: the running window may take focus
+        except Exception:
+            pass
     sock = QLocalSocket()
     sock.connectToServer(SERVER_NAME)
     if not sock.waitForConnected(300):
