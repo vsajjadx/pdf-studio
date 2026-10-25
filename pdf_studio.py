@@ -3014,8 +3014,8 @@ class DocTab(QWidget):
 
         self.del_btns = []
         self.thumbs = ThumbList()
-        self.thumbs.setIconSize(QSize(132, 180))
-        self.thumbs.setFixedWidth(224)
+        self.thumbs.setIconSize(QSize(118, 160))
+        self.thumbs.setFixedWidth(172)
         self.thumbs.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.thumbs.currentRowChanged.connect(self.goto_page)
         self.thumbs.layout_changed.connect(self.place_del_buttons)
@@ -3051,7 +3051,9 @@ class DocTab(QWidget):
         split.setChildrenCollapsible(False)
         split.addWidget(self.thumbs)
         split.addWidget(self.scroll)
+        split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
+        split.setSizes([self.thumbs.width(), 1100])
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(split)
@@ -3138,7 +3140,7 @@ class DocTab(QWidget):
         self.thumbs.clear()
         for i in range(len(self.doc)):
             item = QListWidgetItem(self.thumb_icon(i), str(i + 1))
-            item.setSizeHint(QSize(150, 200))                 # room for the padding around each thumbnail
+            item.setSizeHint(QSize(140, 180))                 # room for the padding around each thumbnail
             item.setToolTip(f"Drag page {i + 1} to a folder or the Desktop to export it. "
                             "Select several pages to export them together.")
             self.thumbs.addItem(item)
