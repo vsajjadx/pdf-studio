@@ -3130,6 +3130,8 @@ class ThumbList(QListWidget):
         self._pm_cache = {}                          # QIcon cache key -> scaled page pixmap
         self._prog = {}                              # row -> how far its page has slid open (0..1)
         self._hover = None                           # row the mouse is on
+        self._pinned = None                          # page being viewed in the main area: stays slid open
+        self._show_sel = False                       # blue frame only after the user clicked a page
         self._anim = QTimer(self)
         self._anim.setInterval(16)
         self._anim.timeout.connect(self._tick)
@@ -3191,15 +3193,48 @@ class ThumbList(QListWidget):
                 return self.model().index(h, 0)         # the opened page owns the area it covers
         return super().indexAt(pos)
 
+    def _target(self):
+        """The page that should be open: the one under the mouse, else the one being viewed."""
+        return self._hover if self._hover is not None else self._pinned
+
+    def _retarget(self):
+        t = self._target()
+        if t is not None:
+            self._prog.setdefault(t, 0.0)
+        if not self._anim.isActive():
+            self._anim.start()
+        self.layout_changed.emit()                   # show / hide the trash icon right away
+
     def _set_hover(self, row):
         if row == self._hover:
             return
         self._hover = row
-        if row is not None:
-            self._prog.setdefault(row, 0.0)
-        if not self._anim.isActive():
-            self._anim.start()
-        self.layout_changed.emit()                   # show / hide the trash icon right away
+        self._retarget()
+
+    def set_pinned(self, row):
+        """Keep page `row` slid open (the page shown in the main view) and scroll the strip so all of it is visible."""
+        if row is not None and not (0 <= row < self.count()):
+            row = None
+        self._pinned = row
+        self._retarget()
+        if row is None:
+            return
+        self.scrollTo(self.model().index(row, 0), QAbstractItemView.ScrollHint.EnsureVisible)
+        r = self.thumb_rect(row)
+        if r is not None:
+            over = r.bottom() + 6 - self.viewport().height()
+            if over > 0:
+                sb = self.verticalScrollBar()
+                sb.setValue(sb.value() + int(over + 0.999))
+
+    def show_selection(self, on=True):
+        self._show_sel = on
+        self.viewport().update()
+
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        if self.indexAt(e.position().toPoint()).isValid():
+            self.show_selection(True)
 
     def _hover_from(self, pos):
         row = self.indexAt(pos).row()
@@ -3211,14 +3246,15 @@ class ThumbList(QListWidget):
             self._hover_from(vp.mapFromGlobal(QCursor.pos()))
 
     def _tick(self):
+        target = self._target()
         for row, p in list(self._prog.items()):
-            tgt = 1.0 if row == self._hover else 0.0
+            tgt = 1.0 if row == target else 0.0
             p = min(tgt, p + 0.14) if p < tgt else max(tgt, p - 0.14)
             if p <= 0.0 and tgt == 0.0:
                 del self._prog[row]
             else:
                 self._prog[row] = p
-        if all(row == self._hover and p >= 1.0 for row, p in self._prog.items()):
+        if all(row == target and p >= 1.0 for row, p in self._prog.items()):
             self._anim.stop()
         self.viewport().update()
         self.layout_changed.emit()
@@ -3251,7 +3287,7 @@ class ThumbList(QListWidget):
         p.save()
         p.setClipRect(shown, Qt.ClipOperation.IntersectClip)
         p.drawPixmap(full.topLeft(), pm)
-        selected = self.selectionModel().isSelected(self.model().index(row, 0))
+        selected = self._show_sel and self.selectionModel().isSelected(self.model().index(row, 0))
         if selected:
             p.setPen(QPen(QColor(ACCENT), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -3288,7 +3324,7 @@ class ThumbList(QListWidget):
             if r.top() - 8 > vh:
                 break
             self._draw_thumb(p, row, r.height(), 0.0)
-        for row, prog in sorted(self._prog.items(), key=lambda kv: (kv[0] == self._hover, kv[1])):
+        for row, prog in sorted(self._prog.items(), key=lambda kv: (kv[0] == self._hover, kv[0] == self._pinned, kv[1])):
             rr = self._reveal_rect(row, prog)        # pages sliding open are drawn over the stack
             if rr is not None and rr.bottom() > 0 and rr.top() < vh:
                 self._draw_thumb(p, row, rr.height(), prog)
@@ -3596,6 +3632,9 @@ class DocTab(QWidget):
         self.cur = max(0, min(keep, len(self.doc) - 1))
         self.thumbs.setCurrentRow(self.cur)
         self.thumbs.blockSignals(False)
+        self.thumbs.show_selection(False)
+        self.thumbs._prog.clear()
+        self.thumbs.set_pinned(self.cur)
         for b in self.del_btns:
             b.hide()
             b.deleteLater()
@@ -3732,6 +3771,8 @@ class DocTab(QWidget):
             self.thumbs.blockSignals(True)
             self.thumbs.setCurrentRow(i)
             self.thumbs.blockSignals(False)
+            self.thumbs.show_selection(False)               # scrolling is not a click: no blue frame
+            self.thumbs.set_pinned(i)                       # the page being viewed slides open in the strip
             self.place_del_buttons()                        # the list may have auto-scrolled while signals were blocked
             self.changed.emit()
 
@@ -3743,6 +3784,7 @@ class DocTab(QWidget):
         self.scroll.verticalScrollBar().setValue(max(0, self.ys[i] - PAGE_MARGIN))
         self._nav = False
         self.update_visible()
+        self.thumbs.set_pinned(i)
         self.place_del_buttons()
         self.changed.emit()
 
@@ -3921,6 +3963,7 @@ class DocTab(QWidget):
             it = self.thumbs.item(r)
             if it:
                 it.setSelected(True)
+        self.thumbs.show_selection(True)
 
     # ---------- right-click menu ----------
     def _reselect(self, rows):
@@ -4095,6 +4138,7 @@ class DocTab(QWidget):
             if item is not None:
                 item.setSelected(True)
             self.thumbs.blockSignals(False)
+            self.thumbs.show_selection(True)
             self.cur = i
             self.place_del_buttons()
             self.changed.emit()
