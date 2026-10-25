@@ -1188,6 +1188,13 @@ def _sheet_landscape(orient, per_sheet, rows, cols, first_page_rect):
     return first_page_rect.width > first_page_rect.height
 
 
+def rot_bbox(w, h, rotation):
+    """Width/height of the bounding box of a w x h page turned by `rotation` degrees (any angle)."""
+    t = math.radians(rotation)
+    c, sn = abs(math.cos(t)), abs(math.sin(t))
+    return w * c + h * sn, w * sn + h * c
+
+
 def layout_sheet(doc, group, rows, cols, aw, ah, scale_mode, scale_percent, offset_pt, rotation=0):
     """Pure geometry for one printed sheet, in PDF points, (0, 0) = top-left of the
     printable area. Returns [(page_index, clip_rect, target_rect), ...] where both
@@ -1203,7 +1210,7 @@ def layout_sheet(doc, group, rows, cols, aw, ah, scale_mode, scale_percent, offs
         r, c = divmod(idx, cols)
         cx, cy = c * (cw + gap), r * (ch + gap)
         pr = doc[pno].rect
-        page_w, page_h = ((pr.height, pr.width) if rotation % 180 else (pr.width, pr.height))
+        page_w, page_h = rot_bbox(pr.width, pr.height, rotation)       # bounding box of the turned page
         s_fit = min(cw / page_w, ch / page_h) if page_w and page_h else 1.0
         if scale_mode == "actual":
             s = 1.0
@@ -1303,7 +1310,7 @@ def _content_box(source, pr):
 def _draw_page_banded(painter, page, dest, r, rotation=0, grayscale=False, compress=False):
     """Draw `page` rasterised at r px/pt into dest=(x, y, w, h) device pixels, in horizontal strips so a
     huge sheet (A0, a plotter roll) never needs one giant bitmap. Rotation is applied to the page
-    content around its center; the paper layout itself is unchanged.
+    content around its center (any angle); dest is the page's own, unrotated rectangle.
     compress=True sends far less data to the printer without touching quality: only the area that
     holds content is rendered and sent, strips that are pure white are skipped (the paper is already
     white), and grayscale pages are rendered straight to 8-bit gray."""
@@ -1322,8 +1329,6 @@ def _draw_page_banded(painter, page, dest, r, rotation=0, grayscale=False, compr
         painter.translate(cx, cy)
         painter.rotate(rotation)
         painter.translate(-cx, -cy)
-        if rotation in (90, 270):
-            dx, dy, dw, dh = cx - dh / 2, cy - dw / 2, dh, dw
     full_w, full_h = max(1, round(pr.width * r)), max(1, round(pr.height * r))
     rows = max(1, min(full_h, int(MAX_BAND_PIXELS // full_w)))
     sx, sy = dw / full_w, dh / full_h
@@ -1445,12 +1450,15 @@ def _print_pdf(parent, doc, st, docname, driver_mode=False):
                 cx, cy, cw, ch = clip
                 tx, ty, dw, dh = target
                 pr = doc[pno].rect
-                page_w = pr.height if rotation % 180 else pr.width
-                s = dw / page_w if page_w else 1.0
+                bw, _bh = rot_bbox(pr.width, pr.height, rotation)
+                s = dw / bw if bw else 1.0
+                uw, uh = pr.width * s, pr.height * s                              # the page's own size on paper
+                ucx, ucy = tx + dw / 2, ty + dh / 2
                 r = min(px_per_pt, (render_dpi / 72.0) * max(1.0, s))             # render at the chosen quality
                 painter.setClipRect(QRectF(cx * px_per_pt, cy * px_per_pt, cw * px_per_pt, ch * px_per_pt))
                 _draw_page_banded(painter, doc[pno],
-                                  (tx * px_per_pt, ty * px_per_pt, dw * px_per_pt, dh * px_per_pt),
+                                  ((ucx - uw / 2) * px_per_pt, (ucy - uh / 2) * px_per_pt,
+                                   uw * px_per_pt, uh * px_per_pt),
                                   r, rotation, st.get("grayscale", False), st.get("compress", False))
     finally:
         painter.end()
@@ -1462,15 +1470,71 @@ def _print_pdf(parent, doc, st, docname, driver_mode=False):
 
 class PreviewLabel(QLabel):
     """The preview label itself: click-drag anywhere on it to nudge the printed
-    content around the sheet (emits the drag delta, in label pixels)."""
+    content around the sheet (emits the drag delta, in label pixels).
+    Hold Shift and a rotate frame appears over the page: drag with Shift held to turn the
+    page by any angle around the frame's centre (hold Ctrl as well to snap to 5 degrees)."""
     dragged = pyqtSignal(QPointF)
     zoomed = pyqtSignal(int)                    # +1 / -1 per wheel notch
     zoom_reset = pyqtSignal()
+    rotated = pyqtSignal(float)                 # new absolute rotation, degrees
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last = None
+        self._frame = None                      # (cx, cy, w, h, angle) in label pixels
+        self._shift = False
+        self._rot_start = None                  # (pointer angle, rotation) while rotating
+        self.get_rotation = lambda: 0
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def set_frame(self, cx, cy=None, w=None, h=None, angle=0):
+        self._frame = None if cx is None else (cx, cy, w, h, angle)
+        self.update()
+
+    def set_shift(self, down):
+        if down != self._shift:
+            self._shift = down
+            if self._rot_start is None:
+                self.setCursor(Qt.CursorShape.CrossCursor if down else Qt.CursorShape.OpenHandCursor)
+            self.update()
+
+    def _pointer_angle(self, pos):
+        cx, cy = self._frame[0], self._frame[1]
+        return math.degrees(math.atan2(pos.y() - cy, pos.x() - cx))
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not (self._shift and self._frame):
+            return
+        cx, cy, w, h, ang = self._frame
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.translate(cx, cy)
+        p.rotate(ang)
+        col = QColor(ACCENT)
+        pen = QPen(col, 1.6, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(QColor(col.red(), col.green(), col.blue(), 28))
+        p.drawRect(QRectF(-w / 2, -h / 2, w, h))
+        p.setPen(QPen(col, 1.6))
+        p.drawLine(QPointF(0, -h / 2), QPointF(0, -h / 2 - 16))              # stem to the handle
+        p.setBrush(col)
+        p.drawEllipse(QPointF(0, -h / 2 - 16), 5, 5)
+        p.drawLine(QPointF(-6, 0), QPointF(6, 0))                           # centre cross
+        p.drawLine(QPointF(0, -6), QPointF(0, 6))
+        p.resetTransform()
+        a = (self.get_rotation() if self._rot_start is None else self._frame[4]) % 360
+        txt = f"{a:.1f}\u00b0".replace(".0\u00b0", "\u00b0")
+        p.setPen(QColor("#ffffff"))
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(txt) + 12
+        box = QRectF(cx - tw / 2, cy + 8, tw, fm.height() + 6)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(box, 5, 5)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(box, Qt.AlignmentFlag.AlignCenter, txt)
+        p.end()
 
     def wheelEvent(self, e):
         dy = e.angleDelta().y()
@@ -1484,18 +1548,37 @@ class PreviewLabel(QLabel):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
+            if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) and self._frame:
+                self._rot_start = (self._pointer_angle(e.position()), self.get_rotation())
+                self.set_shift(True)
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return
             self._last = e.position()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, e):
-        if self._last is not None:
+        self.set_shift(bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+        if self._rot_start is not None and self._frame:
+            a0, r0 = self._rot_start
+            new = r0 + self._pointer_angle(e.position()) - a0
+            if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                new = round(new / 5.0) * 5.0
+            else:
+                for snap in (0, 90, 180, 270, 360):                         # magnetic at the right angles
+                    if abs((new % 360) - snap) < 1.5:
+                        new = snap
+                        break
+            self.rotated.emit(new % 360)
+        elif self._last is not None:
             d = e.position() - self._last
             self._last = e.position()
             self.dragged.emit(d)
 
     def mouseReleaseEvent(self, e):
         self._last = None
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._rot_start = None
+        self.setCursor(Qt.CursorShape.CrossCursor if self._shift else Qt.CursorShape.OpenHandCursor)
+        self.update()
 
 
 class RadioChoice(QObject):
@@ -1726,7 +1809,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
         # Top strip, full width: Printer, size, source, type and Settings in one line
         f1 = QFormLayout()
-        f1.addRow("Printer:", w_printer)
+        f1.addRow(w_printer)
         copies_row = QHBoxLayout()
         copies_row.addWidget(QLabel("Copies:"))
         copies_row.addWidget(self.sp_copies)
@@ -1805,7 +1888,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         nav.addWidget(self.bt_prev)
         nav.addWidget(self.lbl_info, 1)
         nav.addWidget(self.bt_next)
-        lbl_hint = QLabel("Drag: move  •  Wheel: zoom  •  Double-click: reset")
+        lbl_hint = QLabel("Drag: move  •  Wheel: zoom  •  Shift+drag: rotate  •  Double-click: reset")
         lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_hint.setStyleSheet(f"color:{T['MUTED']};font-size:11px")
         self.lbl_zoom = QLabel("100%")
@@ -1879,6 +1962,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_ox.valueChanged.connect(self._ox_changed)
         self.sp_oy.valueChanged.connect(self._oy_changed)
         self.lbl_pv.dragged.connect(self.on_drag)
+        self.lbl_pv.rotated.connect(self._rotate_free)
+        self.lbl_pv.get_rotation = lambda: self.image_rotation
         self.lbl_pv.zoomed.connect(self._wheel_zoom)
         self.lbl_pv.zoom_reset.connect(self._reset_zoom)
         self.bt_rotate_left.clicked.connect(lambda: self._rotate_image(-90))
@@ -2219,8 +2304,31 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 return
         self.update_preview()
 
+    def eventFilter(self, obj, ev):
+        # Shift down/up anywhere in the dialog shows / hides the rotate frame on the preview
+        t = ev.type()
+        if t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and ev.key() == Qt.Key.Key_Shift:
+            self.lbl_pv.set_shift(t == QEvent.Type.KeyPress)
+        elif t == QEvent.Type.WindowDeactivate and obj is self:
+            self.lbl_pv.set_shift(False)
+        return super().eventFilter(obj, ev)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QApplication.instance().installEventFilter(self)
+
+    def hideEvent(self, e):
+        QApplication.instance().removeEventFilter(self)
+        self.lbl_pv.set_shift(False)
+        super().hideEvent(e)
+
     def _rotate_image(self, degrees):
-        self.image_rotation = (self.image_rotation + degrees) % 360
+        self.image_rotation = round(self.image_rotation + degrees, 2) % 360
+        self.update_preview()
+
+    def _rotate_free(self, angle):
+        """Free rotation from the Shift+drag frame on the preview."""
+        self.image_rotation = round(angle, 1) % 360
         self.update_preview()
 
     def _persheet_mode_changed(self, *_):
@@ -2454,6 +2562,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         paper = QImage(max(1, round(pw * k)), max(1, round(ph * k)), QImage.Format.Format_ARGB32_Premultiplied)
         paper.fill(QColor("white"))
         pp = QPainter(paper)
+        first_center = None
         for pno, clip, target in cells:
             cx, cy, cw, ch = clip
             tx, ty, dw, dh = target
@@ -2464,15 +2573,20 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 pp.setPen(QColor("#cccccc"))
                 pp.drawRect(clip_rect.adjusted(0, 0, -1, -1))
             pr = self.doc[pno].rect
-            page_w = pr.height if rotation % 180 else pr.width
-            s = dw / page_w if page_w else 1.0
+            bw, _bh = rot_bbox(pr.width, pr.height, rotation)
+            s = dw / bw if bw else 1.0
+            uw, uh = pr.width * s, pr.height * s                           # the page's own size on paper
             mscale = max(0.05, min(s * k, 2.5))                            # cap preview render cost
             img = pix_to_qimage(self.doc[pno].get_pixmap(matrix=fitz.Matrix(mscale, mscale), alpha=False))
-            if rotation:
-                img = img.transformed(QTransform().rotate(rotation), Qt.TransformationMode.SmoothTransformation)
             if self.ck_grayscale.isChecked():
                 img = img.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_RGB32)
-            pp.drawImage(QRectF(base_x + tx * k, base_y + ty * k, dw * k, dh * k), img)
+            ccx, ccy = base_x + (tx + dw / 2) * k, base_y + (ty + dh / 2) * k
+            if first_center is None:
+                first_center = (ccx, ccy, uw * k, uh * k)
+            pp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            pp.translate(ccx, ccy)
+            pp.rotate(rotation)
+            pp.drawImage(QRectF(-uw * k / 2, -uh * k / 2, uw * k, uh * k), img)
             pp.restore()
         pp.end()
 
@@ -2494,6 +2608,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         p.end()
         self.lbl_pv.setText("")
         self.lbl_pv.setPixmap(pm)
+        if first_center is not None:                                       # for the Shift rotate frame (label coords)
+            fcx, fcy, fw_, fh_ = first_center
+            self.lbl_pv.set_frame(ox + fcx + (self.lbl_pv.width() - pm.width()) / 2,
+                                  oy + fcy + (self.lbl_pv.height() - pm.height()) / 2,
+                                  fw_, fh_, rotation)
+        else:
+            self.lbl_pv.set_frame(None)
 
         rng = f"{sheet[0] + 1}" + (f"–{sheet[-1] + 1}" if len(sheet) > 1 else "")
         info = f"Sheet {self.pv + 1} / {len(grp)}  •  page(s) {rng}\n{paper_label} {'landscape' if ls else 'portrait'}"
