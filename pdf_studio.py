@@ -3735,10 +3735,31 @@ class Main(DarkTitleBarMixin, QMainWindow):
         w = self.tabs.currentWidget()
         return w if isinstance(w, DocTab) else None
 
+    @staticmethod
+    def _is_pdf_file(p):
+        """A .pdf name, or any file that starts with the PDF signature (Explorer 'Open with' can hand over
+        files whose name has no .pdf, e.g. downloads)."""
+        if p.lower().endswith(".pdf"):
+            return True
+        try:
+            with open(p, "rb") as f:
+                return f.read(1024).lstrip(b"\xef\xbb\xbf \r\n\t\x00").startswith(b"%PDF-")
+        except OSError:
+            return False
+
     def open_paths(self, paths):
+        """Open every PDF in `paths`. A path that cannot be opened is reported with its exact text instead of
+        being skipped silently, so a failing 'Open with' shows what Windows actually handed over."""
+        problems = []
         for p in paths:
-            if p.lower().endswith(".pdf") and os.path.exists(p):
+            if not os.path.exists(p):
+                problems.append(f"File not found:\n{p!r}")
+            elif not os.path.isfile(p) or not self._is_pdf_file(p):
+                problems.append(f"Not a PDF file:\n{p!r}")
+            else:
                 self.open_path(p)
+        if problems:
+            QMessageBox.warning(self, "PDF Studio", "\n\n".join(problems))
 
     def open_path(self, p):
         ap = os.path.normcase(os.path.abspath(p))
@@ -4043,7 +4064,18 @@ def _set_app_user_model_id():
             pass
 
 
+def _report_exception(exc_type, exc, tb):
+    """A windowed exe has no console, so an unexpected error would silently end or freeze the app. Show it."""
+    import traceback
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    try:
+        QMessageBox.critical(None, "PDF Studio - unexpected error", text[-3000:])
+    except Exception:
+        _msg(text[-1500:])
+
+
 if __name__ == "__main__":
+    sys.excepthook = _report_exception
     _set_app_user_model_id()
     app = QApplication(sys.argv)
     app.setApplicationName("PDF Studio")
