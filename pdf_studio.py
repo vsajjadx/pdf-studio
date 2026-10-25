@@ -4809,18 +4809,21 @@ class Main(DarkTitleBarMixin, QMainWindow):
         self.toolbar = tb                                    # placed under the tab strip (see __init__)
         T = self._tab_call
         self.a_edit = self._act("✎ Edit text", self.toggle_edit, "Ctrl+E", True)
+        # Close tab / Delete page(s) / Move up / Move down / Merge PDFs are no longer shown in the menus or the
+        # toolbar (tabs have their x, thumbnails have the trash button and drag-to-reorder). The keyboard
+        # shortcuts keep working through hidden window-level actions.
+        for _a in (self._act("Close tab", self.close_tab, "Ctrl+W"),
+                   self._act("Delete page(s)", T("delete_pages"), "Delete"),
+                   self._act("Move up", T("move", -1), "Alt+Up"),
+                   self._act("Move down", T("move", 1), "Alt+Down")):
+            self.addAction(_a)
         acts = {
             "File": [self._act("Open…", self.open_dialog, "Ctrl+O"),
                      self._act("Save", T("save"), "Ctrl+S"),
                      self._act("Save As…", T("save_as"), "Ctrl+Shift+S"),
-                     self._act("🖨 Print…", self.print_doc, "Ctrl+P"),
-                     self._act("Close tab", self.close_tab, "Ctrl+W")],
-            "Pages": [self._act("🗑 Delete page(s)", T("delete_pages"), "Delete"),
-                      self._act("＋ Add blank page", T("add_blank"), "Ctrl+Shift+N"),
+                     self._act("🖨 Print…", self.print_doc, "Ctrl+P")],
+            "Pages": [self._act("＋ Add blank page", T("add_blank"), "Ctrl+Shift+N"),
                       self._act("⇪ Insert PDF…", T("insert_pdf"), "Ctrl+I"),
-                      self._act("⇓ Merge PDFs at end…", T("merge_end")),
-                      self._act("↑ Move up", T("move", -1), "Alt+Up"),
-                      self._act("↓ Move down", T("move", 1), "Alt+Down"),
                       self._act("⟳ Rotate", T("rotate"), "Ctrl+R")],
             "Edit": [self._act("↶ Undo", T("undo"), "Ctrl+Z"), self.a_edit],
             "View": [self._act("Zoom in", lambda: self._zoom(1.2), "Ctrl+="),
