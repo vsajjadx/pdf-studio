@@ -348,6 +348,25 @@ def install_context_menu():
     _notify_assoc_changed()
 
 
+def refresh_registration_if_stale():
+    """Explorer launches PDF Studio with the exe path that was written to the registry when the menu was
+    installed. If the exe was moved, replaced or run from a new folder, that path is dead and double-clicking
+    a PDF starts nothing. When an earlier install exists (never after --uninstall) and its command no longer
+    matches this exe, write the registration again with the current path. Runs in the background."""
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"Software\\Classes\\{_APP_ID}\\shell\\open\\command") as k:
+            registered = winreg.QueryValueEx(k, "")[0]
+    except OSError:
+        return                                              # never installed, or uninstalled: leave it alone
+    if registered == f'{_base_cmd()} "%1"':
+        return
+    import threading
+    threading.Thread(target=install_context_menu, daemon=True).start()
+
+
 def uninstall_context_menu():
     import winreg
     for ext in ALL_EXT:
@@ -3998,4 +4017,5 @@ if __name__ == "__main__":
     w.show()
     w.open_paths(paths)
     QTimer.singleShot(4000, _cleanup_old_page_exports)      # housekeeping after the window is already up
+    QTimer.singleShot(2500, refresh_registration_if_stale)  # fix a dead exe path in the Explorer registration
     sys.exit(app.exec())
