@@ -452,7 +452,7 @@ from PyQt6.QtCore import (Qt, QSize, QSizeF, QPoint, QPointF, QRectF, QMarginsF,
                           QMimeData, QObject, QSettings, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDrag, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
                          QPalette, QPixmap, QPainter, QPen, QPainterPath, QPageLayout, QPageSize, QRadialGradient,
-                         QTextCursor, QTransform)
+                         QTextCursor, QTransform, QIntValidator)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrinter, QPrinterInfo
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QDialog, QDialogButtonBox,
@@ -715,6 +715,9 @@ QToolButton#TabClose:hover { background:$CLOSE_HOVER; color:$TITLE; }
 QStatusBar { background:$SURFACE; border-top:1px solid $LINE; color:$TEXT2; padding:0 8px; }
 QStatusBar::item { border:none; }
 QLabel#StatusPill { background:transparent; border:none; padding:3px 12px; color:$TEXT; }
+QWidget#PageBar { background:$SURFACE; }
+QLabel#PageText { background:transparent; border:none; color:$TEXT2; font-size:15px; font-weight:600; }
+QLineEdit#PageBox { font-size:16px; font-weight:700; padding:1px 6px; min-height:24px; border-radius:6px; }
 
 /* ---------- panels ---------- */
 QListWidget#Thumbs { background:$BODY_PANEL; border:none; padding:6px 4px; color:$BODY_TEXT; outline:0; }
@@ -4537,13 +4540,32 @@ class Main(DarkTitleBarMixin, QMainWindow):
         self.setCentralWidget(central)
 
         # status bar: zoom + "Page x / n" at the bottom right
-        self.zoom_lbl, self.page_lbl = QLabel(), QLabel()
-        self.page_lbl.setMinimumWidth(130)
-        self.page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.page_lbl.setObjectName("StatusPill")
+        self.zoom_lbl = QLabel()
         self.zoom_lbl.setObjectName("StatusPill")
         self.statusBar().addPermanentWidget(self.zoom_lbl)
-        self.statusBar().addPermanentWidget(self.page_lbl)
+        self.statusBar().setMinimumHeight(38)
+        # page counter in the middle of the status bar: "Page [ 3 ] / 8"; type a number + Enter to jump there
+        self.page_lbl = QWidget(self.statusBar())
+        self.page_lbl.setObjectName("PageBar")
+        _pl = QHBoxLayout(self.page_lbl)
+        _pl.setContentsMargins(10, 0, 10, 0)
+        _pl.setSpacing(8)
+        _t1, self.page_total = QLabel("Page"), QLabel("/ 0")
+        for _l in (_t1, self.page_total):
+            _l.setObjectName("PageText")
+        self.page_box = QLineEdit()
+        self.page_box.setObjectName("PageBox")
+        self.page_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_box.setFixedWidth(68)
+        self.page_box.setValidator(QIntValidator(1, 999999, self))
+        self.page_box.setToolTip("Type a page number and press Enter to go to that page")
+        self.page_box.returnPressed.connect(self.page_box_go)
+        self.page_box.installEventFilter(self)
+        _pl.addWidget(_t1)
+        _pl.addWidget(self.page_box)
+        _pl.addWidget(self.page_total)
+        self.statusBar().installEventFilter(self)
+        self.page_lbl.hide()
 
         self._build_actions()
         self._central_lay.insertWidget(1, self.toolbar)       # right under the tab strip
@@ -4609,17 +4631,62 @@ class Main(DarkTitleBarMixin, QMainWindow):
         if tab is self.cur_tab():
             self.update_status()
 
+    def place_page_bar(self):
+        """Keep the page counter centred in the status bar."""
+        sb = self.statusBar()
+        self.page_lbl.adjustSize()
+        w, h = self.page_lbl.sizeHint().width(), sb.height()
+        self.page_lbl.setGeometry((sb.width() - w) // 2, 0, w, h)
+        self.page_lbl.raise_()
+
+    def page_box_go(self):
+        t = self.cur_tab()
+        if not (t and t.doc):
+            return
+        txt = self.page_box.text().strip()
+        if txt.isdigit():
+            t.goto_page(max(1, min(int(txt), len(t.doc))) - 1)
+        t.thumbs.blockSignals(True)                          # keep the thumbnail highlight on the page we jumped to
+        t.thumbs.setCurrentRow(t.cur)
+        t.thumbs.blockSignals(False)
+        t.place_del_buttons()
+        self.page_box.setText(str(t.cur + 1))
+        self.page_box.clearFocus()
+        t.scroll.setFocus()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.statusBar() and ev.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            if self.page_lbl.isVisible():
+                self.place_page_bar()
+        elif obj is self.page_box:
+            if ev.type() == QEvent.Type.FocusIn:
+                QTimer.singleShot(0, self.page_box.selectAll)
+            elif ev.type() == QEvent.Type.FocusOut:
+                t = self.cur_tab()
+                if t and t.doc:
+                    self.page_box.setText(str(t.cur + 1))
+            elif ev.type() == QEvent.Type.KeyPress and ev.key() == Qt.Key.Key_Escape:
+                self.page_box.clearFocus()
+                t = self.cur_tab()
+                if t:
+                    t.scroll.setFocus()
+                return True
+        return super().eventFilter(obj, ev)
+
     def update_status(self):
         t = self.cur_tab()
         if t and t.doc:
-            self.page_lbl.setText(f"Page {t.cur + 1} / {len(t.doc)}")
+            if not self.page_box.hasFocus():                 # don't overwrite a number the user is typing
+                self.page_box.setText(str(t.cur + 1))
+            self.page_total.setText(f"/ {len(t.doc)}")
             self.zoom_lbl.setText(f"{round(t.zoom * 100)}%")
             self.page_lbl.show()
+            self.place_page_bar()
             self.zoom_lbl.show()
             name = os.path.basename(t.path) if t.path else "Untitled"
             self.setWindowTitle(f"{'*' if t.dirty else ''}{name} - PDF Studio")
         else:
-            self.page_lbl.setText("")
+            self.page_box.clear()
             self.zoom_lbl.setText("")
             self.page_lbl.hide()
             self.zoom_lbl.hide()
