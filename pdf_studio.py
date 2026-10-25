@@ -3199,6 +3199,7 @@ class ThumbList(QListWidget):
             self._prog.setdefault(row, 0.0)
         if not self._anim.isActive():
             self._anim.start()
+        self.layout_changed.emit()                   # show / hide the trash icon right away
 
     def _hover_from(self, pos):
         row = self.indexAt(pos).row()
@@ -3659,7 +3660,7 @@ class DocTab(QWidget):
                 b.hide()
                 continue
             r = self.thumbs.thumb_rect(i)
-            if r is None or r.top() + 30 < 0 or r.top() > vp.height():
+            if i != self.thumbs._hover or r is None or r.top() + 30 < 0 or r.top() > vp.height():   # only on the page under the mouse
                 b.hide()
                 continue
             spot = QRectF(r.left() + 4, r.top() + 4, 24, 24)   # inside the thumbnail, top-left corner
