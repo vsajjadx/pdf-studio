@@ -4003,6 +4003,24 @@ class Main(DarkTitleBarMixin, QMainWindow):
         e.accept()
 
     # ---------- explorer menu ----------
+    def offer_install_on_first_run(self):
+        """The exe registers itself only through 'Add right-click menu in Explorer' / --install. A freshly
+        downloaded exe has done neither, so ask once (not again after 'No') instead of leaving the user with
+        no 'Open with' entry and no right-click menu."""
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            return
+        if _registered_exe() is not None or self._settings.value("install/declined") == "1":
+            return
+        answer = QMessageBox.question(
+            self, "PDF Studio",
+            "Add PDF Studio to Explorer?\n\nIt will appear in 'Open with' and in the right-click menu of PDFs, "
+            "and any older version is replaced.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.do_install()
+        else:
+            self._settings.setValue("install/declined", "1")
+
     def do_install(self):
         try:
             install_context_menu()
@@ -4108,4 +4126,6 @@ if __name__ == "__main__":
     w.open_paths(paths)
     QTimer.singleShot(4000, _cleanup_old_page_exports)      # housekeeping after the window is already up
     QTimer.singleShot(2500, refresh_registration_if_stale)  # fix a dead exe path in the Explorer registration
+    if not paths:                                           # started on its own (not to open a file): offer to install
+        QTimer.singleShot(700, w.offer_install_on_first_run)
     sys.exit(app.exec())
