@@ -2374,17 +2374,42 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.oy_mm = v
         self.update_preview()
 
+    def _set_print_scale(self, pct):
+        """Make `pct` (relative to Fit) the real print scale: switches to Custom Scale and sets the
+        spin box, so the preview, the saved settings and the printed output all use the same value."""
+        pct = int(max(self.sp_scale.minimum(), min(self.sp_scale.maximum(), round(pct))))
+        self.sp_scale.blockSignals(True)
+        self.sp_scale.setValue(pct)
+        self.sp_scale.blockSignals(False)
+        idx = self.cb_scale.findData("custom")
+        if idx >= 0 and self.cb_scale.currentIndex() != idx:
+            self.cb_scale.setCurrentIndex(idx)          # fires update_preview through _scale_mode_changed
+        else:
+            self.update_preview()
+
     def _wheel_zoom(self, step):
-        z = self.zoom * (1.15 ** step)
-        self.zoom = max(0.5, min(4.0, round(z, 3)))
-        self.update_preview()
+        # the wheel changes the content's real scale (what gets printed), not just the preview camera
+        cur = getattr(self, "_eff_pct", 100.0)
+        new = cur * (1.15 ** step)
+        if round(new) == round(cur):
+            new = cur + (1 if step > 0 else -1)
+        self._set_print_scale(new)
 
     def _reset_zoom(self):
-        self.zoom = 1.0
+        self.cb_scale.setCurrentIndex(max(0, self.cb_scale.findData("fit")))
+        self.sp_scale.blockSignals(True)
+        self.sp_scale.setValue(100)
+        self.sp_scale.blockSignals(False)
         self.update_preview()
 
     def reset_offset(self):
         self.zoom = 1.0
+        self.cb_scale.blockSignals(True)
+        self.cb_scale.setCurrentIndex(max(0, self.cb_scale.findData("fit")))
+        self.cb_scale.blockSignals(False)
+        self.sp_scale.blockSignals(True)
+        self.sp_scale.setValue(100)
+        self.sp_scale.blockSignals(False)
         self.ox_mm = self.oy_mm = 0.0
         for sp, v in ((self.sp_ox, self.ox_mm), (self.sp_oy, self.oy_mm)):
             sp.blockSignals(True)
@@ -2578,7 +2603,6 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         k = min((self._fw - pad) / pw, (self._fh - pad) / ph) * self.zoom  # preview px per point
         self._k = k
         ox, oy = (self._fw - pw * k) / 2, (self._fh - ph * k) / 2          # centred; overflow is clipped
-        self.lbl_zoom.setText(f"{round(self.zoom * 100)}%")
         m = PRINT_MARGIN_MM / 25.4 * 72
         aw, ah = pw - 2 * m, ph - 2 * m
         base_x, base_y = m * k, m * k                                      # relative to the paper's top-left
@@ -2587,6 +2611,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         rotation = self.image_rotation % 360
         cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah,
                              self.cb_scale.currentData(), self.sp_scale.value(), offset_pt, rotation)
+        # effective scale relative to Fit (also right for "Actual size"), shown next to the preview
+        fit_cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah, "fit", 100, offset_pt, rotation)
+        try:
+            self._eff_pct = cells[0][2][2] / fit_cells[0][2][2] * 100.0
+        except (ZeroDivisionError, IndexError):
+            self._eff_pct = 100.0
+        self.lbl_zoom.setText(f"{round(self._eff_pct)}%")
 
         # 1) render the flat sheet into its own image
         paper = QImage(max(1, round(pw * k)), max(1, round(ph * k)), QImage.Format.Format_ARGB32_Premultiplied)
