@@ -1556,7 +1556,7 @@ class RadioChoice(QObject):
 
 
 class PrintDialog(DarkTitleBarMixin, QDialog):
-    PW, PH = 300, 300                                      # preview size (compact, landscape dialog)
+    PW, PH = 300, 330                                      # preview size (compact, landscape dialog)
 
     def __init__(self, parent, doc, cur, preset=None, initial_preferences=None):
         super().__init__(parent)
@@ -1567,6 +1567,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.ox_mm, self.oy_mm, self._k = 0.0, 0.0, 1.0     # manual pan offset + last preview scale
         self.image_rotation = 0                               # image rotation, independent of paper orientation
         self.zoom = 1.0                                       # preview zoom (mouse wheel), 1.0 = fit
+        self._fw, self._fh = self.PW, self.PH                 # preview frame = the sheet's own proportions
         self._printer_options_touched = False
 
         names = QPrinterInfo.availablePrinterNames()
@@ -1777,7 +1778,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         left.addStretch(1)
 
         self.lbl_pv = PreviewLabel()
-        self.lbl_pv.setFixedSize(self.PW, self.PH)
+        self.lbl_pv.setFixedSize(self.PW + 2, self.PH + 2)
         self.lbl_pv.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_pv.setStyleSheet(f"background:{T['CANVAS']};border:1px solid {T['LINE2']};"
                                   f"border-radius:2px;color:{T['TEXT']}")
@@ -1816,7 +1817,12 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         right = QVBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(6)
-        right.addWidget(self.lbl_pv, 0, Qt.AlignmentFlag.AlignHCenter)
+        pv_box = QWidget()                                       # fixed area; the frame inside follows the sheet's shape
+        pv_box.setFixedSize(self.PW + 2, self.PH + 2)
+        pv_lay = QVBoxLayout(pv_box)
+        pv_lay.setContentsMargins(0, 0, 0, 0)
+        pv_lay.addWidget(self.lbl_pv, 0, Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(pv_box, 0, Qt.AlignmentFlag.AlignHCenter)
         right.addLayout(rotate_row)
         right.addWidget(lbl_hint)
         right.addLayout(nav)
@@ -2389,7 +2395,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         f.setPointSize(8)
         p.setFont(f)
         bw, bh = 52, 18
-        br = QRectF(self.PW - bw - 8, self.PH - bh - 8, bw, bh)
+        br = QRectF(self._fw - bw - 8, self._fh - bh - 8, bw, bh)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor("#ff9f1c") if back else QColor("#1473E6"))
         p.drawRoundedRect(br, 9, 9)
@@ -2425,10 +2431,15 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         pw, ph = (ps.height(), ps.width()) if ls else (ps.width(), ps.height())
         duplex = self.duplex_value()
         back = duplex != "none" and self.pv % 2 == 1
-        pad = 20 if duplex == "none" else 84                               # extra room for the curl
-        k = min((self.PW - pad) / pw, (self.PH - pad) / ph) * self.zoom    # preview px per point
+        # the frame always has the printed sheet's proportions (A4 portrait, landscape, custom size ...),
+        # so what you drag and zoom matches the page exactly
+        fit = min(self.PW / pw, self.PH / ph)
+        self._fw, self._fh = max(1, round(pw * fit)), max(1, round(ph * fit))
+        self.lbl_pv.setFixedSize(self._fw + 2, self._fh + 2)
+        pad = 0 if duplex == "none" else 64                                # extra room for the curl
+        k = min((self._fw - pad) / pw, (self._fh - pad) / ph) * self.zoom  # preview px per point
         self._k = k
-        ox, oy = (self.PW - pw * k) / 2, (self.PH - ph * k) / 2             # centred; overflow is clipped
+        ox, oy = (self._fw - pw * k) / 2, (self._fh - ph * k) / 2          # centred; overflow is clipped
         self.lbl_zoom.setText(f"{round(self.zoom * 100)}%")
         m = PRINT_MARGIN_MM / 25.4 * 72
         aw, ah = pw - 2 * m, ph - 2 * m
@@ -2466,7 +2477,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         pp.end()
 
         # 2) put it on the preview canvas (flat, or bent towards the flip edge for two-sided)
-        pm = QPixmap(self.PW, self.PH)
+        pm = QPixmap(self._fw, self._fh)
         pm.fill(Qt.GlobalColor.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
