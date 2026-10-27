@@ -46,3 +46,5 @@ Windows 10 or 11, Python 3.10+ when running from source. The print driver featur
 ## Persian summary / خلاصه
 
 PDF Studio یک نرم‌افزار سبک برای خواندن و ویرایش PDF در ویندوز است: هر فایل در یک تب جدا باز می‌شود، صفحه‌ها پشت‌سرهم نمایش داده می‌شوند و می‌توانید صفحه‌ها را حذف، اضافه، جابه‌جا، بچرخانید یا PDF دیگری را وارد کنید. پنجرهٔ چاپ کامل آن شامل انتخاب چاپگر، اندازهٔ کاغذ (A0 تا A5 و دلخواه)، دوطرفه، سینی دستی (Bypass)، نوع کاغذ و پیش‌نمایش زنده است. ظاهر برنامه شبیه Acrobat است و به‌صورت پیش‌فرض دارک است.
+
+- **Instant open.** Closing the window keeps PDF Studio loaded in the tray, so the next PDF you open appears immediately. Tray menu: keep running in background (on/off), Start with Windows, Exit.

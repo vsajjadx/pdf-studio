@@ -207,6 +207,8 @@ def _fast_forward(paths):
 
 
 if not (len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall", "--export-icon")):
+    if "--background" in sys.argv and _fast_forward(["::noop::"]):
+        sys.exit(0)                                         # already running: nothing to do
     if _fast_forward(_open_after or
                      [os.path.abspath(a) for a in sys.argv[1:] if not a.startswith("--")]):
         sys.exit(0)
@@ -429,7 +431,7 @@ from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDrag, QFont, QIcon, 
                          QTextCursor, QTextBlockFormat, QTransform, QIntValidator)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrinter, QPrinterInfo
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
+from PyQt6.QtWidgets import (QSystemTrayIcon, QApplication, QButtonGroup, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                              QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGraphicsDropShadowEffect,
                              QGridLayout, QGroupBox, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -794,6 +796,32 @@ def _theme_palette():
     for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
         pal.setColor(QPalette.ColorGroup.Disabled, role, C(T["DISABLED"]))
     return pal
+
+
+def _autostart_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+            winreg.QueryValueEx(k, "PDFStudio")
+            return True
+    except OSError:
+        return False
+
+
+def _set_autostart(on):
+    """Start PDF Studio hidden when Windows starts, so double-clicking a PDF opens it instantly."""
+    try:
+        import winreg
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run")
+        if on:
+            winreg.SetValueEx(k, "PDFStudio", 0, winreg.REG_SZ, f'{_base_cmd()} --background')
+        else:
+            try:
+                winreg.DeleteValue(k, "PDFStudio")
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def apply_theme(app):
@@ -6387,6 +6415,9 @@ class Main(DarkTitleBarMixin, QMainWindow):
             finished.append(True)
             buf.extend(bytes(sock.readAll()))
             paths = [l for l in buf.decode("utf-8", "ignore").splitlines() if l.strip()]
+            if paths == ["::noop::"]:
+                sock.deleteLater()
+                return
             self.open_paths(paths)
             self.bring_to_front()
             sock.deleteLater()
@@ -6505,7 +6536,51 @@ class Main(DarkTitleBarMixin, QMainWindow):
             if not self.maybe_save(self.tabs.widget(i)):
                 return e.ignore()
         self._settings.setValue("window/geometry", self.saveGeometry())
+        if self._tray is not None and not self._quitting and self._settings.value("background/keep", "1") != "0":
+            for i in reversed(range(self.tabs.count())):    # free the documents, keep the process (and Qt) loaded
+                t = self.tabs.widget(i)
+                self.tabs.removeTab(i)
+                t.deleteLater()
+            self.stack.setCurrentIndex(0)
+            self.update_status()
+            self.hide()
+            e.ignore()                                      # the next PDF you open appears instantly
+            return
         e.accept()
+
+    # ---------- stays loaded in the background so the next PDF opens instantly ----------
+    _tray, _quitting = None, False
+
+    def setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(app_icon(), self)
+        tray.setToolTip("PDF Studio")
+        m = QMenu()
+        m.addAction("Open PDF Studio", self.bring_to_front)
+        keep = m.addAction("Keep running in background (instant open)")
+        keep.setCheckable(True)
+        keep.setChecked(self._settings.value("background/keep", "1") != "0")
+        keep.toggled.connect(lambda on: self._settings.setValue("background/keep", "1" if on else "0"))
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            auto = m.addAction("Start with Windows")
+            auto.setCheckable(True)
+            auto.setChecked(_autostart_enabled())
+            auto.toggled.connect(_set_autostart)
+        m.addSeparator()
+        m.addAction("Exit", self.quit_app)
+        tray.setContextMenu(m)
+        tray.activated.connect(lambda r: self.bring_to_front() if r in (QSystemTrayIcon.ActivationReason.Trigger,
+                                                                        QSystemTrayIcon.ActivationReason.DoubleClick) else None)
+        tray.show()
+        self._tray, self._tray_menu = tray, m
+
+    def quit_app(self):
+        self._quitting = True
+        if self.close():
+            QApplication.quit()
+        else:
+            self._quitting = False
 
     # ---------- explorer menu ----------
     def offer_install_on_first_run(self):
@@ -6624,14 +6699,21 @@ if __name__ == "__main__":
     mode, server = acquire_instance(paths)
     if mode == "forwarded":
         sys.exit(0)
+    app.setQuitOnLastWindowClosed(False)                    # closing the window keeps the app loaded in the tray
+    background = "--background" in sys.argv
     w = Main()
     if server:
         w.attach_server(server)
-    w.show()
+    w.setup_tray()
+    app.commitDataRequest.connect(lambda *_: setattr(w, "_quitting", True))   # Windows logoff / shutdown must not be blocked
+    if w._tray is None:
+        app.setQuitOnLastWindowClosed(True)
+    if not background or paths:
+        w.show()
     w.open_paths(paths)
     import threading
     QTimer.singleShot(4000, lambda: threading.Thread(target=_cleanup_old_page_exports, daemon=True).start())
     QTimer.singleShot(2500, refresh_registration_if_stale)  # fix a dead exe path in the Explorer registration
-    if not paths:                                           # started on its own (not to open a file): offer to install
+    if not paths and not background:                       # started on its own (not to open a file): offer to install
         QTimer.singleShot(700, w.offer_install_on_first_run)
     sys.exit(app.exec())
