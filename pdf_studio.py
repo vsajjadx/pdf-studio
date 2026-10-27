@@ -3354,6 +3354,28 @@ def _swatch_icon(color, size=18):
     return QIcon(pm)
 
 
+class LazyFontCombo(QComboBox):
+    """Font list that is only filled when the drop-down is opened (reading every installed font up front made Edit slow)."""
+    _filled = False
+
+    def fill(self):
+        if self._filled:
+            return
+        self._filled = True
+        cur = self.currentText()
+        self.blockSignals(True)
+        self.addItems(font_families())
+        i = self.findText(cur, Qt.MatchFlag.MatchFixedString) if cur else -1
+        self.setCurrentIndex(i)
+        if i < 0:
+            self.setEditText(cur)
+        self.blockSignals(False)
+
+    def showPopup(self):
+        self.fill()
+        super().showPopup()
+
+
 class EditPanel(QFrame):
     """The bar under the toolbar while Edit is on: text font / size / colour / alignment / line spacing,
     ready-made shapes with their line and fill, and page borders."""
@@ -3386,15 +3408,11 @@ class EditPanel(QFrame):
         r1 = QHBoxLayout()
         r1.setSpacing(4)
         r1.addWidget(QLabel("Text"))
-        self.font_box = QComboBox()
+        self.font_box = LazyFontCombo()
         self.font_box.setEditable(True)
         self.font_box.setMinimumWidth(190)
         self.font_box.setMaximumWidth(240)
         self.font_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        fams = font_families()
-        self.font_box.addItems(fams)
-        for i, name in enumerate(fams):
-            self.font_box.setItemData(i, QFont(name), Qt.ItemDataRole.FontRole)
         self.font_box.setCurrentIndex(-1)
         self.font_box.setToolTip("Font of the selected text (blank = the text's own font)")
         self.font_box.activated.connect(lambda _i: self._emit_family())
@@ -3556,10 +3574,10 @@ class EditPanel(QFrame):
         """Show the properties of the selected text without announcing them as changes."""
         for w in (self.font_box, self.size_box, self.b_bold, self.b_italic, self.sp_box, *self.b_align.values()):
             w.blockSignals(True)
-        i = self.font_box.findText(family or "", Qt.MatchFlag.MatchFixedString) if family else -1
+        i = self.font_box.findText(family or "", Qt.MatchFlag.MatchFixedString) if (family and self.font_box._filled) else -1
         self.font_box.setCurrentIndex(i)
-        if i < 0 and family:
-            self.font_box.setEditText(family)
+        if i < 0:
+            self.font_box.setEditText(family or "")
         self.size_box.setValue(float(size))
         self.b_bold.setChecked(bool(bold))
         self.b_italic.setChecked(bool(italic))
@@ -4447,6 +4465,8 @@ class DocTab(QWidget):
 
     def showEvent(self, e):
         super().showEvent(e)
+        if self.edit_mode and self._panel is None:
+            self.panel.setVisible(True)                     # built when the tab is actually shown, not for every open tab
         if self._pending:
             QTimer.singleShot(0, self._after_build)
 
@@ -5174,8 +5194,10 @@ class DocTab(QWidget):
 
     def set_edit(self, on):
         self.edit_mode = on
-        if on or self._panel is not None:
-            self.panel.setVisible(on)
+        if self._panel is not None:
+            self._panel.setVisible(on)
+        elif on and self.isVisible():
+            self.panel.setVisible(True)
         if on:
             self._clear_armed_export()
         else:
