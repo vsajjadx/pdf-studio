@@ -100,7 +100,7 @@ def merge_main(paths):
             files = glob.glob(os.path.join(qdir, "*.txt"))
             if len(files) != last:
                 last, stable = len(files), time.time()
-            if time.time() - stable >= 0.7:
+            if time.time() - stable >= 0.35:
                 break
             time.sleep(0.1)
         items = []
@@ -268,7 +268,12 @@ def _deploy_exe():
                 pass
     shutil.rmtree(_install_dir(), ignore_errors=True)
     os.makedirs(_install_dir(), exist_ok=True)
-    shutil.copy2(me, target)
+    src_dir = os.path.dirname(me)
+    if os.path.isdir(os.path.join(src_dir, "_internal")):   # folder build (starts much faster than a single-file exe)
+        shutil.rmtree(_install_dir(), ignore_errors=True)
+        shutil.copytree(src_dir, _install_dir())
+    else:
+        shutil.copy2(me, target)
     return target
 
 
@@ -4612,15 +4617,16 @@ class DocTab(QWidget):
         self.changed.emit()
 
     def place_del_buttons(self):
-        """Each trash button sits in the top-left corner of its page thumbnail."""
+        """Each trash button sits in the top-left corner of its page thumbnail (only the page under the mouse shows one)."""
         vp = self.thumbs.viewport()
+        hov = self.thumbs._hover
         for i, b in enumerate(self.del_btns):
-            it = self.thumbs.item(i)
-            if it is None:
-                b.hide()
+            if i != hov:
+                if b.isVisible():
+                    b.hide()
                 continue
-            r = self.thumbs.thumb_rect(i)
-            if i != self.thumbs._hover or r is None or r.top() + 30 < 0 or r.top() > vp.height():   # only on the page under the mouse
+            r = self.thumbs.thumb_rect(i) if self.thumbs.item(i) is not None else None
+            if r is None or r.top() + 30 < 0 or r.top() > vp.height():
                 b.hide()
                 continue
             spot = QRectF(r.left() + 4, r.top() + 4, 24, 24)   # inside the thumbnail, top-left corner
@@ -6623,7 +6629,8 @@ if __name__ == "__main__":
         w.attach_server(server)
     w.show()
     w.open_paths(paths)
-    QTimer.singleShot(4000, _cleanup_old_page_exports)      # housekeeping after the window is already up
+    import threading
+    QTimer.singleShot(4000, lambda: threading.Thread(target=_cleanup_old_page_exports, daemon=True).start())
     QTimer.singleShot(2500, refresh_registration_if_stale)  # fix a dead exe path in the Explorer registration
     if not paths:                                           # started on its own (not to open a file): offer to install
         QTimer.singleShot(700, w.offer_install_on_first_run)

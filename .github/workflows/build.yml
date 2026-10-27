@@ -21,20 +21,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
       - name: Build
-        run: pyinstaller --noconfirm --onefile --windowed --noupx --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --hidden-import fontTools.subset --collect-submodules fontTools.ttLib --name PDFStudio --icon pdfstudio.ico pdf_studio.py
+        run: pyinstaller --noconfirm --onedir --windowed --noupx --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --hidden-import fontTools.subset --collect-submodules fontTools.ttLib --name PDFStudio --icon pdfstudio.ico pdf_studio.py
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path dist/PDFStudio.exe -DestinationPath PDFStudio-windows.zip
+        run: Compress-Archive -Path dist/PDFStudio -DestinationPath PDFStudio-windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: PDFStudio-windows
           path: |
-            dist/PDFStudio.exe
             PDFStudio-windows.zip
       - name: Publish release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/PDFStudio.exe
             PDFStudio-windows.zip
