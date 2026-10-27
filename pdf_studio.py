@@ -7,7 +7,7 @@ PDF Studio - PDF reader/editor for Windows
   * built-in print dialog: printer, A0-A5 + custom size, orientation, scale, page range, duplex,
     paper source (auto / bypass tray), paper type,
     save-toner and grayscale modes, flip on left/right or top/bottom edge, and live preview
-  * Explorer right-click: combine multiple PDFs/images, or open a single selection directly
+  * Explorer right-click: combine multiple PDFs/images (kept in memory, no file is written until you save), or open a single selection directly
   * single window: opening another PDF while the app is running adds a new tab
   * Acrobat-style look, dark grey by default (start with --light for the light theme): document tabs above
     the toolbar, thumbnail panel on the left, grey page canvas, blue pill buttons, red app mark
@@ -36,6 +36,7 @@ APP_USER_MODEL_ID = "PDFStudio.PDFStudio.1"     # Windows taskbar identity (own 
 # ============================================================================
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".gif")
 ALL_EXT = (".pdf",) + IMG_EXT
+MERGE_TAG = "::merge::"                                    # first line of a hand-over: "combine the files below"
 
 
 def _natural_key(s):
@@ -122,42 +123,14 @@ def merge_main(paths):
         _msg("فایل معتبری برای باز کردن پیدا نشد.\nNo supported file was found.", 0x30)
         return
 
-    if len(items) == 1:
-        only = items[0]
-        if only.lower().endswith(".pdf"):
-            return only
+    if len(items) == 1 and items[0].lower().endswith(".pdf"):
+        return [items[0]]                                   # a single PDF is simply opened
+    return [MERGE_TAG] + items                              # everything else is combined inside the app, in memory
 
-        # The viewer opens PDFs, not raw image paths. Wrap a single image in a
-        # temporary one-page PDF so Explorer's Combine command opens it directly.
-        import pymupdf as fitz
-        temp_dir = None
-        out = None
-        try:
-            os.makedirs(_page_export_root(), exist_ok=True)
-            temp_dir = tempfile.mkdtemp(prefix="single_open_", dir=_page_export_root())
-            base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_",
-                          os.path.splitext(os.path.basename(only))[0]).strip(" .")[:80] or "image"
-            target = os.path.join(temp_dir, f"{base}.pdf")
-            out = fitz.open()
-            pm = fitz.Pixmap(only)
-            w, h = (842, 595) if pm.width > pm.height else (595, 842)
-            page = out.new_page(width=w, height=h)
-            k = min((w - 40) / pm.width, (h - 40) / pm.height)
-            iw, ih = pm.width * k, pm.height * k
-            page.insert_image(
-                fitz.Rect(w / 2 - iw / 2, h / 2 - ih / 2, w / 2 + iw / 2, h / 2 + ih / 2),
-                filename=only)
-            out.save(target, garbage=3, deflate=True)
-            return target
-        except Exception as e:
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            _msg(f"فایل باز نشد:\n{e}\nCould not open file.", 0x30)
-            return
-        finally:
-            if out is not None:
-                out.close()
 
+def combine_to_doc(items):
+    """Combine PDFs and images into ONE document held in memory. Nothing is written to disk: the result opens as an
+    unsaved tab and becomes a file only when the user saves it. Returns (document, [skipped files])."""
     import pymupdf as fitz
     out = fitz.open()
     skipped = []
@@ -179,19 +152,15 @@ def merge_main(paths):
                 out.insert_pdf(d)
         except Exception as e:
             skipped.append(f"{os.path.basename(p)} ({e})")
-    if len(out) == 0:
-        _msg("Nothing could be merged.")
-        return
-    folder = os.path.dirname(items[0])
-    target, n = os.path.join(folder, "Combined.pdf"), 1
+    return out, skipped
+
+
+def _unique_target(folder, base="Combined"):
+    target, n = os.path.join(folder, base + ".pdf"), 1
     while os.path.exists(target):
         n += 1
-        target = os.path.join(folder, f"Combined ({n}).pdf")
-    out.save(target, garbage=3, deflate=True)
-    out.close()
-    if skipped:
-        _msg("Skipped:\n" + "\n".join(skipped), 0x30)
-    return target                                           # opened in the app below
+        target = os.path.join(folder, f"{base} ({n}).pdf")
+    return target
 
 
 _open_after = None
@@ -238,7 +207,7 @@ def _fast_forward(paths):
 
 
 if not (len(sys.argv) > 1 and sys.argv[1] in ("--install", "--uninstall", "--export-icon")):
-    if _fast_forward([_open_after] if _open_after else
+    if _fast_forward(_open_after or
                      [os.path.abspath(a) for a in sys.argv[1:] if not a.startswith("--")]):
         sys.exit(0)
 
@@ -484,7 +453,9 @@ def page_size_for(paper, custom_mm=(210.0, 297.0)):
 
 def pix_to_qimage(pix):
     fmt = QImage.Format.Format_RGBA8888 if pix.alpha else QImage.Format.Format_RGB888
-    return QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
+    img = QImage(pix.samples_mv, pix.width, pix.height, pix.stride, fmt)
+    img._keep = pix                                         # the image reads straight from the pixmap: no copy
+    return img
 
 
 def icon_pixmap(n=256):
@@ -4369,6 +4340,7 @@ class DocTab(QWidget):
         super().__init__()
         self.main = main
         self.doc, self.path, self.cur = None, None, 0
+        self.title, self.suggest = None, None               # unsaved in-memory documents (Combine): tab name, proposed file name
         self.zoom, self.undo_stack, self.dirty = 1.4, [], False
         self.labels, self.ys, self.hs, self.imgs = [], [], [], {}
         self._armed_export_format = None
@@ -4415,13 +4387,7 @@ class DocTab(QWidget):
         self.drop_line.setStyleSheet(f"background:{ACCENT};border-radius:2px")
         self.drop_line.hide()
 
-        self.panel = EditPanel()                            # font / alignment / shapes / borders, only while Edit is on
-        self.panel.hide()
-        self.panel.fmt_changed.connect(self._on_fmt)
-        self.panel.shape_style_changed.connect(self._on_shape_style)
-        self.panel.tool_changed.connect(self._set_tool)
-        self.panel.border_requested.connect(self._on_border)
-        self.panel.arrange.connect(self._on_arrange)
+        self._panel = None                                  # the Edit bar is built the first time Edit is switched on
 
         split = QSplitter()
         split.setHandleWidth(4)
@@ -4434,7 +4400,7 @@ class DocTab(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        lay.addWidget(self.panel)
+        self._lay = lay
         lay.addWidget(split, 1)
 
     # ---------- state ----------
@@ -4467,6 +4433,13 @@ class DocTab(QWidget):
         self.refresh_thumbs()
         return True
 
+    def load_doc(self, d, title, suggest):
+        """Show a document that only exists in memory. It is dirty, so closing asks first, and Save asks for a file."""
+        self.doc, self.path, self.cur, self.undo_stack, self.dirty = d, None, 0, [], True
+        self.title, self.suggest = title, suggest
+        self._center_h = True
+        self.refresh_thumbs()
+
     def save(self):
         if not self.doc:
             return False
@@ -4477,7 +4450,7 @@ class DocTab(QWidget):
     def save_as(self):
         if not self.doc:
             return False
-        p, _ = QFileDialog.getSaveFileName(self.main, "Save PDF", self.path or "", "PDF (*.pdf)")
+        p, _ = QFileDialog.getSaveFileName(self.main, "Save PDF", self.path or self.suggest or "", "PDF (*.pdf)")
         return self._write(p) if p else False
 
     def _pdf_bytes(self):
@@ -4529,12 +4502,42 @@ class DocTab(QWidget):
             ic.addPixmap(out, mode)                          # same pixmap for every state -> no blue selection tint
         return ic
 
+    def _thumb_placeholder(self, i):
+        r = self.doc[i].rect
+        out = QPixmap(max(1, math.ceil(r.width * 0.32)), max(1, math.ceil(r.height * 0.32)))
+        out.fill(QColor("white"))
+        p = QPainter(out)
+        p.setPen(QPen(QColor(*T["THUMB_RIM"]), 1))
+        p.drawRect(QRectF(0.5, 0.5, out.width() - 1, out.height() - 1))
+        p.end()
+        ic = QIcon()
+        for mode in (QIcon.Mode.Normal, QIcon.Mode.Active, QIcon.Mode.Selected):
+            ic.addPixmap(out, mode)
+        return ic
+
+    def _thumb_tick(self, gen):
+        """Draw the missing thumbnails a few at a time so a big PDF opens at once and the window stays responsive."""
+        if gen != self._thumb_gen or not self.doc:
+            return
+        for _ in range(3):
+            if not self._thumb_todo:
+                return
+            i = self._thumb_todo.pop()
+            it = self.thumbs.item(i)
+            if it is not None and i < len(self.doc):
+                it.setIcon(self.thumb_icon(i))
+        self.thumbs.viewport().update()
+        if self._thumb_todo:
+            QTimer.singleShot(1, lambda g=gen: self._thumb_tick(g))
+
     def refresh_thumbs(self, keep=None, screen_off=None):
         keep = self.cur if keep is None else keep
         self.thumbs.blockSignals(True)
         self.thumbs.clear()
-        for i in range(len(self.doc)):
-            item = QListWidgetItem(self.thumb_icon(i), str(i + 1))
+        n_pages = len(self.doc)
+        near = set(range(max(0, keep - 6), min(n_pages, keep + 7))) if n_pages > 24 else set(range(n_pages))
+        for i in range(n_pages):                              # big files: only the pages around the current one now, the rest in the background
+            item = QListWidgetItem(self.thumb_icon(i) if i in near else self._thumb_placeholder(i), str(i + 1))
             item.setSizeHint(QSize(140, THUMB_STRIP))         # stacked pages: each page owns only its top strip
             item.setToolTip(f"Drag page {i + 1} to a folder or the Desktop to export it. "
                             "Select several pages to export them together.")
@@ -4544,6 +4547,10 @@ class DocTab(QWidget):
             lh = last.icon().pixmap(THUMB_BOX).deviceIndependentSize().height()
             last.setSizeHint(QSize(140, max(THUMB_STRIP, int(lh) + THUMB_PAD + 8)))
         self.cur = max(0, min(keep, len(self.doc) - 1))
+        self._thumb_gen = getattr(self, "_thumb_gen", 0) + 1
+        self._thumb_todo = sorted((i for i in range(n_pages) if i not in near), key=lambda i: abs(i - self.cur), reverse=True)
+        if self._thumb_todo:
+            QTimer.singleShot(20, lambda g=self._thumb_gen: self._thumb_tick(g))
         self.thumbs.setCurrentRow(self.cur)
         self.thumbs.blockSignals(False)
         self.thumbs.show_selection(False)
@@ -4667,12 +4674,15 @@ class DocTab(QWidget):
         sb = self.scroll.verticalScrollBar().value()
         vh = max(self.scroll.viewport().height(), 400)
         lo, hi = sb - vh, sb + 2 * vh
-        for i, (y, h) in enumerate(zip(self.ys, self.hs)):
-            if y + h >= lo and y <= hi:
-                self.render_page(i)
-            elif i in self.imgs:                            # far away: free memory
-                del self.imgs[i]
-                self.labels[i].clear()
+        first = max(0, bisect.bisect_right(self.ys, lo) - 1)         # pages are stacked top to bottom: binary search
+        last = min(len(self.ys), bisect.bisect_right(self.ys, hi))
+        want = [i for i in range(first, last) if self.ys[i] + self.hs[i] >= lo and self.ys[i] <= hi]
+        keep = set(want)
+        for i in [k for k in self.imgs if k not in keep]:             # far away: free memory
+            del self.imgs[i]
+            self.labels[i].clear()
+        for i in want:
+            self.render_page(i)
 
     def on_scroll(self, value):
         self.update_visible()
@@ -5115,9 +5125,23 @@ class DocTab(QWidget):
             ed.hide()
             ed.deleteLater()
 
+    @property
+    def panel(self):
+        if self._panel is None:
+            p = self._panel = EditPanel()
+            p.hide()
+            p.fmt_changed.connect(self._on_fmt)
+            p.shape_style_changed.connect(self._on_shape_style)
+            p.tool_changed.connect(self._set_tool)
+            p.border_requested.connect(self._on_border)
+            p.arrange.connect(self._on_arrange)
+            self._lay.insertWidget(0, p)
+        return self._panel
+
     def set_edit(self, on):
         self.edit_mode = on
-        self.panel.setVisible(on)
+        if on or self._panel is not None:
+            self.panel.setVisible(on)
         if on:
             self._clear_armed_export()
         else:
@@ -5136,7 +5160,8 @@ class DocTab(QWidget):
     # -- the Edit bar --
     def _set_tool(self, kind):
         self.edit_tool = kind
-        self.panel.set_tool(kind)
+        if self._panel is not None:
+            self._panel.set_tool(kind)
         if kind:
             self.edit_sel = []
             self._commit_editor()
@@ -6143,6 +6168,9 @@ class Main(DarkTitleBarMixin, QMainWindow):
     def open_paths(self, paths):
         """Open every PDF in `paths`. A path that cannot be opened is reported with its exact text instead of
         being skipped silently, so a failing 'Open with' shows what Windows actually handed over."""
+        if paths and paths[0] == MERGE_TAG:
+            self.open_combined(paths[1:])
+            return
         problems = []
         for p in paths:
             if not os.path.exists(p):
@@ -6153,6 +6181,30 @@ class Main(DarkTitleBarMixin, QMainWindow):
                 self.open_path(p)
         if problems:
             QMessageBox.warning(self, "PDF Studio", "\n\n".join(problems))
+
+    def open_combined(self, items):
+        """Explorer > Combine: build the merged PDF in memory and show it as an unsaved tab."""
+        items = [p for p in items if os.path.isfile(p)]
+        if not items:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            d, skipped = combine_to_doc(items)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if len(d) == 0:
+            QMessageBox.warning(self, "PDF Studio", "Nothing could be combined.")
+            return
+        tab = DocTab(self)
+        tab.load_doc(d, "Combined", _unique_target(os.path.dirname(items[0])))
+        tab.set_edit(self.a_edit.isChecked())
+        tab.changed.connect(lambda t=tab: self.on_tab_changed(t))
+        i = self.tabs.addTab(tab, "")
+        self.stack.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(i)
+        self.on_tab_changed(tab)
+        if skipped:
+            QMessageBox.warning(self, "PDF Studio", "Skipped:\n" + "\n".join(skipped))
 
     def open_path(self, p):
         ap = os.path.normcase(os.path.abspath(p))
@@ -6176,7 +6228,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
         i = self.tabs.indexOf(tab)
         if i < 0:
             return
-        name = os.path.basename(tab.path) if tab.path else "Untitled"
+        name = os.path.basename(tab.path) if tab.path else (tab.title or "Untitled")
         self.tabs.setTabText(i, ("● " if tab.dirty else "") + name)
         self.tabs.setTabToolTip(i, tab.path or name)
         if tab is self.cur_tab():
@@ -6562,7 +6614,7 @@ if __name__ == "__main__":
         sys.exit(0)
     apply_theme(app)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    paths = [_open_after] if _open_after else [os.path.abspath(a) for a in args]
+    paths = _open_after or [os.path.abspath(a) for a in args]
     mode, server = acquire_instance(paths)
     if mode == "forwarded":
         sys.exit(0)
