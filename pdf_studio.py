@@ -4473,7 +4473,15 @@ class DocTab(QWidget):
     # ---------- file ----------
     def load(self, p):
         try:
-            d = fitz.open(p)
+            d = None
+            try:                                            # read into memory: Windows never keeps the file locked / undeletable
+                if os.path.getsize(p) <= 300 * 1024 * 1024:
+                    with open(p, "rb") as fh:
+                        d = fitz.open("pdf", fh.read())
+            except Exception:
+                d = None
+            if d is None:
+                d = fitz.open(p)
             if d.needs_pass:
                 pw, ok = QInputDialog.getText(self.main, "Password", "Password:", QLineEdit.EchoMode.Password)
                 if not ok or not d.authenticate(pw):
@@ -4787,7 +4795,11 @@ class DocTab(QWidget):
 
     def undo(self):
         if self.undo_stack:
-            self.doc = fitz.open("pdf", self.undo_stack.pop())
+            old, self.doc = self.doc, fitz.open("pdf", self.undo_stack.pop())
+            try:
+                old.close()
+            except Exception:
+                pass
             self.dirty = True
             self.refresh_thumbs()
 
@@ -6365,6 +6377,23 @@ class Main(DarkTitleBarMixin, QMainWindow):
             return tab.save()
         return True
 
+    @staticmethod
+    def _dispose_tab(t):
+        """Really let go of the file: closing the document releases the Windows file lock at once, so the PDF can be
+        deleted, moved or replaced as soon as its tab is closed (deleteLater alone leaves it open until garbage collection)."""
+        try:
+            t._commit_editor()
+        except Exception:
+            pass
+        d, t.doc = t.doc, None
+        t.imgs, t._objs, t.undo_stack = {}, {}, []
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+        t.deleteLater()
+
     def close_tab(self, i=None):
         if i is None or isinstance(i, bool):
             i = self.tabs.currentIndex()
@@ -6374,7 +6403,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
         if not self.maybe_save(t):
             return
         self.tabs.removeTab(i)
-        t.deleteLater()
+        self._dispose_tab(t)
         if self.tabs.count() == 0:
             self.stack.setCurrentIndex(0)
         self.update_status()
@@ -6562,7 +6591,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
             for i in reversed(range(self.tabs.count())):    # free the documents, keep the process (and Qt) loaded
                 t = self.tabs.widget(i)
                 self.tabs.removeTab(i)
-                t.deleteLater()
+                self._dispose_tab(t)
             self.stack.setCurrentIndex(0)
             self.update_status()
             self.hide()
