@@ -1816,6 +1816,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
         self.rb_adjust_all = QRadioButton("All printed pages")
         self.rb_adjust_page = QRadioButton("Each page separately")
+        self.rb_adjust_selected = QRadioButton("Selected pages")
         self.rb_adjust_all.setChecked(True)
         self.rb_adjust_all.setToolTip(
             "Zoom, move and rotation affect every page in this print job."
@@ -1823,9 +1824,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.rb_adjust_page.setToolTip(
             "Remember zoom, move and rotation independently for each PDF page."
         )
+        self.rb_adjust_selected.setToolTip(
+            "Copy the adjustment from one source page to every other page or a custom page list."
+        )
         self.grp_adjust_scope = QButtonGroup(self)
         self.grp_adjust_scope.addButton(self.rb_adjust_all)
         self.grp_adjust_scope.addButton(self.rb_adjust_page)
+        self.grp_adjust_scope.addButton(self.rb_adjust_selected)
         self.lbl_adjust_page = QLabel("Page to adjust:")
         self.cb_adjust_page = QComboBox()
         self.cb_adjust_page.setMinimumWidth(118)
@@ -1834,6 +1839,36 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         )
         self.lbl_adjust_page.setVisible(False)
         self.cb_adjust_page.setVisible(False)
+
+        self.rb_adjust_alternate = QRadioButton("Every other page")
+        self.rb_adjust_custom = QRadioButton("Custom pages:")
+        self.rb_adjust_alternate.setChecked(True)
+        self.rb_adjust_alternate.setToolTip(
+            "Copy from the source page to that page and every second printed page after it."
+        )
+        self.rb_adjust_custom.setToolTip(
+            "Copy from the source page to the page numbers entered here."
+        )
+        self.grp_adjust_pattern = QButtonGroup(self)
+        self.grp_adjust_pattern.addButton(self.rb_adjust_alternate)
+        self.grp_adjust_pattern.addButton(self.rb_adjust_custom)
+        self.ed_adjust_custom = QLineEdit()
+        self.ed_adjust_custom.setPlaceholderText("e.g. 1, 3, 5-8")
+        self.ed_adjust_custom.setToolTip(
+            "Enter PDF page numbers or ranges, for example: 1, 3, 5-8."
+        )
+        self.ed_adjust_custom.setMinimumWidth(138)
+        self.w_adjust_pattern = QWidget()
+        pattern_row = QHBoxLayout(self.w_adjust_pattern)
+        pattern_row.setContentsMargins(26, 0, 0, 0)
+        pattern_row.setSpacing(8)
+        pattern_row.addWidget(QLabel("Apply copied adjustment to:"))
+        pattern_row.addWidget(self.rb_adjust_alternate)
+        pattern_row.addWidget(self.rb_adjust_custom)
+        pattern_row.addWidget(self.ed_adjust_custom, 1)
+        pattern_row.addStretch(1)
+        self.w_adjust_pattern.setVisible(False)
+        self.ed_adjust_custom.setEnabled(False)
 
         # Two-sided printing: one tick turns it on, two more ticks pick the flip edge
         self.ck_duplex = QCheckBox("Print on both sides of paper")
@@ -1954,6 +1989,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         adjust_row.addWidget(QLabel("Apply zoom / move / rotation to:"))
         adjust_row.addWidget(self.rb_adjust_all)
         adjust_row.addWidget(self.rb_adjust_page)
+        adjust_row.addWidget(self.rb_adjust_selected)
         adjust_row.addWidget(self.lbl_adjust_page)
         adjust_row.addWidget(self.cb_adjust_page)
         adjust_row.addStretch(1)
@@ -1964,6 +2000,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         left.addLayout(copies_row)
         left.addLayout(row_pg)
         left.addWidget(adjust_box)
+        left.addWidget(self.w_adjust_pattern)
         left.addWidget(box("Page Sizing && Handling", v2))
         left.addStretch(1)
 
@@ -2063,7 +2100,11 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_persheet.valueChanged.connect(self.update_preview)
         self.rb_adjust_all.toggled.connect(self._adjust_scope_changed)
         self.rb_adjust_page.toggled.connect(self._adjust_scope_changed)
+        self.rb_adjust_selected.toggled.connect(self._adjust_scope_changed)
         self.cb_adjust_page.currentIndexChanged.connect(self._adjust_page_changed)
+        self.rb_adjust_alternate.toggled.connect(self._adjust_pattern_changed)
+        self.rb_adjust_custom.toggled.connect(self._adjust_pattern_changed)
+        self.ed_adjust_custom.textChanged.connect(self._adjust_pattern_changed)
         for r in (self.rb_all, self.rb_cur, self.rb_range):
             r.toggled.connect(self.update_preview)
         self.ed_range.textChanged.connect(self.update_preview)
@@ -2265,7 +2306,43 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 "options_touched": self._printer_options_touched}
 
     def _adjust_scope(self):
-        return "page" if self.rb_adjust_page.isChecked() else "all"
+        if self.rb_adjust_page.isChecked():
+            return "page"
+        if self.rb_adjust_selected.isChecked():
+            return "selected"
+        return "all"
+
+    def _adjust_target_mode(self):
+        return "custom" if self.rb_adjust_custom.isChecked() else "alternate"
+
+    def _adjust_target_pages(self):
+        """Return the printed PDF pages that receive the source page's adjustment."""
+        pages = self.pages() or []
+        if not pages:
+            return []
+        source = self._active_adjust_page()
+        if source not in pages:
+            source = pages[0]
+        if self._adjust_target_mode() == "alternate":
+            # The source page defines the parity: page 1 -> 1,3,5… and page 2 -> 2,4,6… .
+            return [pno for pno in pages if (pno - source) % 2 == 0]
+        parsed = parse_range(self.ed_adjust_custom.text(), len(self.doc))
+        if parsed is None:
+            return []
+        wanted = set(parsed)
+        return [pno for pno in pages if pno in wanted]
+
+    def _adjust_target_summary(self):
+        if self._adjust_target_mode() == "alternate":
+            return "every other page"
+        targets = self._adjust_target_pages()
+        return f"{len(targets)} selected page(s)" if targets else "no valid pages"
+
+    def _adjust_pattern_changed(self, *_):
+        custom = self._adjust_target_mode() == "custom"
+        self.ed_adjust_custom.setEnabled(custom)
+        if not self._restoring_preferences:
+            self.update_preview()
 
     def _read_adjustment(self):
         """Read the three preview controls that can be page-specific."""
@@ -2313,7 +2390,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             return None
 
     def _save_current_page_adjustment(self):
-        if self._adjust_scope() != "page" or self._loading_page_adjustment:
+        if self._adjust_scope() not in ("page", "selected") or self._loading_page_adjustment:
             return
         pno = self._editing_page
         if pno is None:
@@ -2383,13 +2460,30 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 return
 
     def _preview_page_settings(self):
-        if self._adjust_scope() != "page":
+        scope = self._adjust_scope()
+        if scope not in ("page", "selected"):
             return None
         self._save_current_page_adjustment()
         base = self._page_adjustment_base or self._read_adjustment()
+        pages = self.pages() or []
+        if scope == "page":
+            return {
+                int(pno): self._print_adjustment(self._page_adjustments.get(int(pno), base))
+                for pno in pages
+            }
+        source = self._active_adjust_page()
+        if source not in pages:
+            source = pages[0] if pages else None
+        source_adjustment = (self._page_adjustments.get(int(source))
+                             if source is not None else None) or self._read_adjustment()
+        targets = set(self._adjust_target_pages())
+        if source is not None:
+            targets.add(int(source))
         return {
-            int(pno): self._print_adjustment(self._page_adjustments.get(int(pno), base))
-            for pno in (self.pages() or [])
+            int(pno): self._print_adjustment(
+                source_adjustment if int(pno) in targets
+                else self._page_adjustments.get(int(pno), base))
+            for pno in pages
         }
 
     def _adjust_scope_changed(self, *_):
@@ -2397,11 +2491,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             return
         scope = self._adjust_scope()
         previous = self._last_adjust_scope
-        if scope == "page":
-            if previous != "page" and not self._restoring_preferences:
+        if scope in ("page", "selected"):
+            if previous not in ("page", "selected") and not self._restoring_preferences:
                 self._page_adjustment_base = self._read_adjustment()
+            self.lbl_adjust_page.setText("Page to adjust:" if scope == "page" else "Copy from page:")
             self.lbl_adjust_page.setVisible(True)
             self.cb_adjust_page.setVisible(True)
+            self.w_adjust_pattern.setVisible(scope == "selected")
             target, _ = self._refresh_adjust_page_items(
                 getattr(self, "_preferred_adjust_page", None))
             self._preferred_adjust_page = None
@@ -2409,11 +2505,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 self._load_page_adjustment(target)
                 self._show_page_in_preview(target)
         else:
-            if previous == "page":
+            if previous in ("page", "selected"):
                 self._save_current_page_adjustment()
             self.lbl_adjust_page.setVisible(False)
             self.cb_adjust_page.setVisible(False)
+            self.w_adjust_pattern.setVisible(False)
         self._last_adjust_scope = scope
+        self._adjust_pattern_changed()
         if not self._restoring_preferences:
             self.update_preview()
 
@@ -2448,7 +2546,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
     def step(self, d):
         self.pv += d
-        if self._adjust_scope() == "page":
+        if self._adjust_scope() in ("page", "selected"):
             groups = self.groups()
             if groups:
                 self.pv = max(0, min(self.pv, len(groups) - 1))
@@ -2545,10 +2643,16 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self._page_adjustment_base = (self._normalise_adjustment(prefs.get("page_adjustment_base"))
                                       if prefs else None) or self._read_adjustment()
         scope = prefs.get("adjust_scope", "all") if prefs else "all"
-        old = self.rb_adjust_page.blockSignals(True)
-        self.rb_adjust_page.setChecked(scope == "page")
-        self.rb_adjust_page.blockSignals(old)
-        self.rb_adjust_all.setChecked(scope != "page")
+        target_mode = prefs.get("adjust_target_mode", "alternate") if prefs else "alternate"
+        self.rb_adjust_custom.setChecked(target_mode == "custom")
+        self.rb_adjust_alternate.setChecked(target_mode != "custom")
+        self.ed_adjust_custom.setText(prefs.get("adjust_target_text", "") if prefs else "")
+        if scope == "page":
+            self.rb_adjust_page.setChecked(True)
+        elif scope == "selected":
+            self.rb_adjust_selected.setChecked(True)
+        else:
+            self.rb_adjust_all.setChecked(True)
         self._last_adjust_scope = self._adjust_scope()
         self._restoring_preferences = False
         self._adjust_scope_changed()
@@ -2574,6 +2678,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             "image_rotation": self.image_rotation,
             "adjust_scope": self._adjust_scope(),
             "adjust_page": self._active_adjust_page(),
+            "adjust_target_mode": self._adjust_target_mode(),
+            "adjust_target_text": self.ed_adjust_custom.text(),
             "page_adjustment_base": self._page_adjustment_base or self._read_adjustment(),
             "page_adjustments": {int(pno): dict(value) for pno, value in self._page_adjustments.items()},
             "save_toner": self.ck_save_toner.isChecked(),
@@ -2859,7 +2965,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
     def update_preview(self, *_):
         if not self._loading_page_adjustment and not self._restoring_preferences:
-            if self._adjust_scope() == "page":
+            if self._adjust_scope() in ("page", "selected"):
                 self._save_current_page_adjustment()
                 target, old = self._refresh_adjust_page_items()
                 if target is not None and target != old:
@@ -2921,7 +3027,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                              rotation, page_settings)
         fit_cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah, "fit", 100,
                                  (0.0, 0.0), rotation, fit_page_settings)
-        focus_page = self._active_adjust_page() if self._adjust_scope() == "page" else None
+        focus_page = self._active_adjust_page() if self._adjust_scope() in ("page", "selected") else None
         focus_idx = next((i for i, cell in enumerate(cells) if cell[0] == focus_page), 0)
         try:
             self._eff_pct = cells[focus_idx][2][2] / fit_cells[focus_idx][2][2] * 100.0
@@ -2995,6 +3101,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             info += f"\nsheet {self.pv // 2 + 1}, {'front' if self.pv % 2 == 0 else 'back'}"
         if self._adjust_scope() == "page" and focus_page is not None:
             info += f"\nadjusting page {focus_page + 1}"
+        elif self._adjust_scope() == "selected" and focus_page is not None:
+            info += f"\ncopying page {focus_page + 1} to {self._adjust_target_summary()}"
         self.lbl_info.setText(info)
 
 
