@@ -21,6 +21,23 @@ Icon file:      python pdf_studio.py --export-icon pdfstudio.ico   (used for the
 """
 import sys, os, re, time, glob, tempfile, math, bisect, string, html as _html, shutil
 
+# A few Windows utilities (notably VPN clients) install their own Qt6Core.dll.
+# PyInstaller normally adds the bundled Qt directory to the DLL search path, but
+# the Windows loader can still resolve a same-named system DLL first.  When the
+# app is frozen, register and preload our Qt core before importing PyQt6 so the
+# print-preview build is deterministic on machines with another Qt installation.
+_FROZEN_QT_DLL_DIR = None
+if getattr(sys, "frozen", False) and sys.platform.startswith("win"):
+    try:
+        import ctypes as _ctypes
+        _frozen_root = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        _frozen_qt_bin = os.path.join(_frozen_root, "PyQt6", "Qt6", "bin")
+        if os.path.isdir(_frozen_qt_bin):
+            _FROZEN_QT_DLL_DIR = os.add_dll_directory(_frozen_qt_bin)
+            _ctypes.WinDLL(os.path.join(_frozen_qt_bin, "Qt6Core.dll"))
+    except (OSError, AttributeError):
+        pass
+
 # PyMuPDF loads its optional page-layout analyser (onnxruntime + numpy) on import when it is installed. PDF Studio
 # never uses it, and it costs about half a second on every start, so keep it out. Must run before `import pymupdf`.
 os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
@@ -437,7 +454,7 @@ from PyQt6.QtWidgets import (QSystemTrayIcon, QApplication, QButtonGroup, QColor
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QRadioButton,
                              QScrollArea, QAbstractItemView, QSpinBox, QSplitter, QStyledItemDelegate,
-                             QStackedWidget, QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
+                             QStackedWidget, QStyle, QTabBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 PAGE_GAP = 12      # px between pages in the continuous view
 PAGE_MARGIN = 12   # px around the whole document
@@ -563,18 +580,18 @@ def _icon_ref():
 # ============================================================================
 _THEMES = {
     "dark": dict(
-        BG="#3C3C3C", SURFACE="#444444", STRIP="#303030", CANVAS="#353535", PANEL="#3C3C3C",
-        LINE="#565656", LINE2="#6A6A6A", HOVER="#505050", PRESS="#5C5C5C", SEL="#24456E", SEL_TEXT="#9CC7FF",
-        TEXT="#E6E6E6", TEXT2="#BDBDBD", MUTED="#9A9A9A", DISABLED="#6A6A6A", TITLE="#FFFFFF",
-        FIELD="#333333", FIELD_BORDER="#7A7A7A", FIELD_BORDER_H="#B0B0B0",
-        BTN_BG="#444444", BTN_BORDER="#8E8E8E", BTN_BORDER_H="#E6E6E6", BTN_HOVER="#505050", BTN_PRESS="#5C5C5C",
-        DIS_BG="#3C3C3C", DIS_BORDER="#565656", PRIM_DIS_BG="#4C4C4C", TAB_HOVER="#3A3A3A",
-        SB_TRACK="#3C3C3C", SB_HANDLE="#6A6A6A", SB_HANDLE_H="#8A8A8A", CLOSE_HOVER="#5C5C5C", CHIP="#4C4C4C",
-        SELECTION="#2F5C9E", TRACK="#565656", TIP_BG="#4C4C4C", TIP_BORDER="#6A6A6A", MENU_SEL_TEXT="#FFFFFF",
-        CHECK_COL="#E6E6E6", ARROW="#CFCFCF",
-        ACC="#2680EB", ACC_HOVER="#4B9CF5", ACC_PRESS="#1473E6", DRAG="#378EF0",
-        BODY="#4A4A4A", BODY_PANEL="#3B3B3B", BODY_TEXT="#BDBDBD", BODY_HOVER="#505050",
-        BODY_SB_TRACK="#3B3B3B", BODY_SB_HANDLE="#6E6E6E", BODY_SB_HANDLE_H="#8C8C8C",
+        BG="#15171B", SURFACE="#1E2127", STRIP="#181A1F", CANVAS="#282C33", PANEL="#1B1E23",
+        LINE="#2D323A", LINE2="#3B424D", HOVER="#292E36", PRESS="#343B46", SEL="#1E4B7A", SEL_TEXT="#C7E2FF",
+        TEXT="#F2F4F7", TEXT2="#B7C0CC", MUTED="#818B99", DISABLED="#5B6572", TITLE="#FFFFFF",
+        FIELD="#171A1F", FIELD_BORDER="#4A5360", FIELD_BORDER_H="#6E7B8B",
+        BTN_BG="#242931", BTN_BORDER="#46505D", BTN_BORDER_H="#8492A3", BTN_HOVER="#2E3540", BTN_PRESS="#39424F",
+        DIS_BG="#1B1E23", DIS_BORDER="#2D323A", PRIM_DIS_BG="#304051", TAB_HOVER="#232832",
+        SB_TRACK="#1B1E23", SB_HANDLE="#46505D", SB_HANDLE_H="#657386", CLOSE_HOVER="#343B46", CHIP="#252B33",
+        SELECTION="#2A5D96", TRACK="#303741", TIP_BG="#20252C", TIP_BORDER="#4A5564", MENU_SEL_TEXT="#FFFFFF",
+        CHECK_COL="#F2F4F7", ARROW="#CAD3DE",
+        ACC="#5B9DFF", ACC_HOVER="#79B2FF", ACC_PRESS="#3C86E6", DRAG="#6DAAFF",
+        BODY="#24282F", BODY_PANEL="#1D2127", BODY_TEXT="#C2CAD5", BODY_HOVER="#2A3038",
+        BODY_SB_TRACK="#1D2127", BODY_SB_HANDLE="#4A5563", BODY_SB_HANDLE_H="#69788A",
         RIM=(255, 255, 255, 38), THUMB_RIM=(255, 255, 255, 70), DARK=True),
     "light": dict(
         BG="#F4F4F4", SURFACE="#FFFFFF", STRIP="#EBEBEB", CANVAS="#E4E4E4", PANEL="#F4F4F4",
@@ -654,11 +671,11 @@ QMainWindow#AppWindow, QDialog#AppWindow { background:$BG; }
 QLabel { color:$TEXT; }
 
 /* ---------- menu bar + menus ---------- */
-QMenuBar { background:$SURFACE; border-bottom:1px solid $LINE; padding:0 6px; spacing:0; }
-QMenuBar::item { background:transparent; padding:6px 11px; border-radius:0; color:$TEXT; }
+QMenuBar { background:$SURFACE; border-bottom:1px solid $LINE; padding:0 10px; spacing:2px; min-height:30px; }
+QMenuBar::item { background:transparent; padding:5px 10px; border-radius:6px; color:$TEXT; }
 QMenuBar::item:selected { background:$HOVER; }
 QMenuBar::item:pressed { background:$PRESS; }
-QMenu { background:$SURFACE; border:1px solid $LINE2; padding:4px 0; color:$TEXT; }
+QMenu { background:$SURFACE; border:1px solid $LINE2; border-radius:8px; padding:5px 0; color:$TEXT; }
 QMenu::item { background:transparent; padding:6px 34px 6px 28px; margin:0; }
 QMenu::item:selected { background:$SEL; color:$MENU_SEL_TEXT; }
 QMenu::item:disabled { background:transparent; color:$DISABLED; }
@@ -667,21 +684,21 @@ QMenu::indicator { width:14px; height:14px; left:7px; }
 QMenu::indicator:checked { image:url($CHECKD); }
 
 /* ---------- toolbar (strip under the tabs) ---------- */
-QToolBar { background:$SURFACE; border:none; border-top:1px solid $LINE; border-bottom:1px solid $LINE;
-           padding:3px 8px; spacing:2px; }
-QToolBar QToolButton { background:transparent; border:1px solid transparent; border-radius:4px;
-                       padding:5px 10px; margin:0 1px; color:$TEXT; }
+QToolBar { background:$SURFACE; border:none; border-bottom:1px solid $LINE;
+           padding:4px 12px; spacing:4px; min-height:42px; }
+QToolBar QToolButton { background:transparent; border:1px solid transparent; border-radius:8px;
+                       padding:6px; margin:0; min-width:30px; min-height:30px; color:$TEXT; }
 QToolBar QToolButton:hover { background:$HOVER; }
 QToolBar QToolButton:pressed { background:$PRESS; }
 QToolBar QToolButton:checked { background:$SEL; border-color:$ACC; color:$SEL_TEXT; }
 QToolBar QToolButton#qt_toolbar_ext_button { padding:0; margin:0 0 0 4px; min-width:24px; }
-QToolBar::separator { background:$LINE; width:1px; margin:6px 6px; }
+QToolBar::separator { background:$LINE; width:1px; margin:7px 5px; }
 
 /* ---------- document tabs ---------- */
 QTabBar { background:$STRIP; qproperty-drawBase:0; }
 QTabBar::tab { background:transparent; border:1px solid transparent; border-bottom:none;
-               border-top-left-radius:4px; border-top-right-radius:4px;
-               padding:7px 6px 7px 14px; margin:6px 1px 0 1px; min-width:90px; max-width:240px; color:$TEXT2; }
+               border-top-left-radius:8px; border-top-right-radius:8px;
+               padding:7px 6px 7px 12px; margin:4px 2px 0 2px; min-width:90px; max-width:240px; color:$TEXT2; }
 QTabBar::tab:hover { background:$TAB_HOVER; color:$TEXT; }
 QTabBar::tab:selected { background:$SURFACE; border:1px solid $LINE; border-bottom:none;
                         border-top:2px solid $ACC; color:$TITLE; }
@@ -690,16 +707,16 @@ QToolButton#TabClose { background:transparent; border:none; border-radius:3px; p
 QToolButton#TabClose:hover { background:$CLOSE_HOVER; color:$TITLE; }
 
 /* ---------- status bar ---------- */
-QStatusBar { background:$SURFACE; border-top:1px solid $LINE; color:$TEXT2; padding:0 8px; }
+QStatusBar { background:$SURFACE; border-top:1px solid $LINE; color:$TEXT2; padding:0 10px; min-height:30px; }
 QStatusBar::item { border:none; }
-QLabel#StatusPill { background:transparent; border:none; padding:3px 12px; color:$TEXT; }
+QLabel#StatusPill { background:transparent; border:none; padding:2px 8px; color:$TEXT2; }
 QWidget#PageBar { background:$SURFACE; }
-QLabel#PageText { background:transparent; border:none; color:$TEXT2; font-size:22px; font-weight:700; }
-QLineEdit#PageBox { font-size:16px; font-weight:700; padding:1px 6px; min-height:24px; border-radius:6px; }
+QLabel#PageText { background:transparent; border:none; color:$TEXT2; font-size:12px; font-weight:600; }
+QLineEdit#PageBox { font-size:12px; font-weight:600; padding:1px 5px; min-height:22px; border-radius:6px; }
 
 /* ---------- panels ---------- */
-QListWidget#Thumbs { background:$BODY_PANEL; border:none; padding:6px 4px; color:$BODY_TEXT; outline:0; }
-QListWidget#Thumbs::item { border-radius:3px; color:$BODY_TEXT; }
+QListWidget#Thumbs { background:$BODY_PANEL; border:none; padding:8px 5px; color:$BODY_TEXT; outline:0; }
+QListWidget#Thumbs::item { border-radius:6px; color:$BODY_TEXT; }
 QListWidget#Thumbs::item:hover { background:$BODY_HOVER; }
 QListWidget#Thumbs::item:selected { background:$SEL; color:$SEL_TEXT; }
 QListWidget#Thumbs::item:selected:!active { background:$SEL; color:$SEL_TEXT; }
@@ -711,8 +728,8 @@ QScrollArea#PageScroll QScrollBar::handle:horizontal { background:$BODY_SB_HANDL
 QListWidget#Thumbs QScrollBar::handle:vertical:hover, QScrollArea#PageScroll QScrollBar::handle:vertical:hover,
 QScrollArea#PageScroll QScrollBar::handle:horizontal:hover { background:$BODY_SB_HANDLE_H; }
 QScrollArea#PageScroll > QWidget > QWidget { background:transparent; }
-QSplitter::handle { background:$LINE; }
-QSplitter::handle:hover { background:$LINE2; }
+QSplitter::handle { background:$LINE; width:1px; }
+QSplitter::handle:hover { background:$ACC; }
 
 QFrame#EmptyCard { background:$SURFACE; border:1px solid $LINE; border-radius:8px; }
 QLabel#EmptyTitle { font-size:22pt; font-weight:700; color:$TITLE; background:transparent; }
@@ -720,11 +737,11 @@ QLabel#EmptySub { color:$MUTED; background:transparent; }
 QLabel#KeyHint { background:$CHIP; border:1px solid $LINE; border-radius:4px; padding:3px 10px; color:$MUTED; }
 
 /* ---------- scrollbars ---------- */
-QScrollBar:vertical { background:$SB_TRACK; width:13px; margin:0; }
-QScrollBar::handle:vertical { background:$SB_HANDLE; border-radius:3px; min-height:40px; margin:2px 2px; }
+QScrollBar:vertical { background:$SB_TRACK; width:10px; margin:0; }
+QScrollBar::handle:vertical { background:$SB_HANDLE; border-radius:5px; min-height:40px; margin:2px 2px; }
 QScrollBar::handle:vertical:hover { background:$SB_HANDLE_H; }
-QScrollBar:horizontal { background:$SB_TRACK; height:13px; margin:0; }
-QScrollBar::handle:horizontal { background:$SB_HANDLE; border-radius:3px; min-width:40px; margin:2px 2px; }
+QScrollBar:horizontal { background:$SB_TRACK; height:10px; margin:0; }
+QScrollBar::handle:horizontal { background:$SB_HANDLE; border-radius:5px; min-width:40px; margin:2px 2px; }
 QScrollBar::handle:horizontal:hover { background:$SB_HANDLE_H; }
 QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; background:none; border:none; }
 QScrollBar::add-page, QScrollBar::sub-page { background:transparent; }
@@ -1212,12 +1229,19 @@ def rot_bbox(w, h, rotation):
     return w * c + h * sn, w * sn + h * c
 
 
-def layout_sheet(doc, group, rows, cols, aw, ah, scale_mode, scale_percent, offset_pt, rotation=0):
+def layout_sheet(doc, group, rows, cols, aw, ah, scale_mode, scale_percent, offset_pt,
+                 rotation=0, page_settings=None):
     """Pure geometry for one printed sheet, in PDF points, (0, 0) = top-left of the
     printable area. Returns [(page_index, clip_rect, target_rect), ...] where both
     rects are (x, y, w, h) tuples; clip_rect is each tile's own slot (so an enlarged
     or panned page never bleeds into its neighbour), target_rect is where the page
-    is actually drawn."""
+    is actually drawn, and the fourth item is that page's effective rotation.
+
+    ``page_settings`` is optional and lets the print preview carry a different
+    scale, offset, or rotation for individual pages.  Keeping the defaults as
+    arguments preserves the original all-pages behaviour and makes the helper
+    useful to callers that do not need per-page adjustments.
+    """
     gap = CELL_GAP_PT if rows * cols > 1 else 0
     cw = (aw - gap * (cols - 1)) / cols
     ch = (ah - gap * (rows - 1)) / rows
@@ -1227,17 +1251,23 @@ def layout_sheet(doc, group, rows, cols, aw, ah, scale_mode, scale_percent, offs
         r, c = divmod(idx, cols)
         cx, cy = c * (cw + gap), r * (ch + gap)
         pr = doc[pno].rect
-        page_w, page_h = rot_bbox(pr.width, pr.height, rotation)       # bounding box of the turned page
+        cfg = page_settings.get(pno, {}) if page_settings else {}
+        page_rotation = float(cfg.get("rotation", rotation)) % 360
+        page_scale_mode = cfg.get("scale_mode", scale_mode)
+        page_scale_percent = cfg.get("scale_percent", scale_percent)
+        page_offset = cfg.get("offset_pt", offset_pt)
+        page_w, page_h = rot_bbox(pr.width, pr.height, page_rotation)   # bounding box of the turned page
         s_fit = min(cw / page_w, ch / page_h) if page_w and page_h else 1.0
-        if scale_mode == "actual":
+        if page_scale_mode == "actual":
             s = 1.0
-        elif scale_mode == "custom":
-            s = s_fit * (scale_percent / 100.0)
+        elif page_scale_mode == "custom":
+            s = s_fit * (page_scale_percent / 100.0)
         else:
             s = s_fit
         dw, dh = page_w * s, page_h * s
-        tx, ty = cx + (cw - dw) / 2 + ox, cy + (ch - dh) / 2 + oy
-        out.append((pno, (cx, cy, cw, ch), (tx, ty, dw, dh)))
+        page_ox, page_oy = page_offset
+        tx, ty = cx + (cw - dw) / 2 + page_ox, cy + (ch - dh) / 2 + page_oy
+        out.append((pno, (cx, cy, cw, ch), (tx, ty, dw, dh), page_rotation))
     return out
 
 
@@ -1462,12 +1492,13 @@ def _print_pdf(parent, doc, st, docname, driver_mode=False):
             aw, ah = area.width() / px_per_pt, area.height() / px_per_pt         # printable area, in points
             rotation = st.get("image_rotation", 0) % 360
             cells = layout_sheet(doc, group, rows, cols, aw, ah, st["scale_mode"],
-                                 st["scale_percent"], offset_pt, rotation)
-            for pno, clip, target in cells:
+                                 st["scale_percent"], offset_pt, rotation,
+                                 st.get("page_adjustments"))
+            for pno, clip, target, page_rotation in cells:
                 cx, cy, cw, ch = clip
                 tx, ty, dw, dh = target
                 pr = doc[pno].rect
-                bw, _bh = rot_bbox(pr.width, pr.height, rotation)
+                bw, _bh = rot_bbox(pr.width, pr.height, page_rotation)
                 s = dw / bw if bw else 1.0
                 uw, uh = pr.width * s, pr.height * s                              # the page's own size on paper
                 ucx, ucy = tx + dw / 2, ty + dh / 2
@@ -1476,7 +1507,7 @@ def _print_pdf(parent, doc, st, docname, driver_mode=False):
                 _draw_page_banded(painter, doc[pno],
                                   ((ucx - uw / 2) * px_per_pt, (ucy - uh / 2) * px_per_pt,
                                    uw * px_per_pt, uh * px_per_pt),
-                                  r, rotation, st.get("grayscale", False), st.get("compress", False))
+                                  r, page_rotation, st.get("grayscale", False), st.get("compress", False))
     finally:
         painter.end()
     if canceled:
@@ -1687,6 +1718,16 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.zoom = 1.0                                       # preview zoom (mouse wheel), 1.0 = fit
         self._fw, self._fh = self.PW, self.PH                 # preview frame = the sheet's own proportions
         self._printer_options_touched = False
+        # Preview adjustments can be kept globally (the original behaviour) or
+        # remembered per PDF page.  The base is the fallback for pages that have
+        # not been edited individually yet.
+        self._page_adjustments = {}
+        self._page_adjustment_base = None
+        self._loading_page_adjustment = False
+        self._refreshing_adjust_pages = False
+        self._last_adjust_scope = "all"
+        self._editing_page = None
+        self._restoring_preferences = False
 
         names = QPrinterInfo.availablePrinterNames()
         self.cb_printer = QComboBox()
@@ -1772,6 +1813,22 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             grp.addButton(b)
         self.ed_range = QLineEdit()
         self.ed_range.setPlaceholderText("e.g. 1-3, 5, 8-")
+
+        self.cb_adjust_scope = QComboBox()
+        self.cb_adjust_scope.addItem("All printed pages", "all")
+        self.cb_adjust_scope.addItem("Each page individually", "page")
+        self.cb_adjust_scope.setToolTip(
+            "Choose whether zoom, move and rotation affect every printed page\n"
+            "or are remembered separately for each page."
+        )
+        self.lbl_adjust_page = QLabel("Page to adjust:")
+        self.cb_adjust_page = QComboBox()
+        self.cb_adjust_page.setMinimumWidth(118)
+        self.cb_adjust_page.setToolTip(
+            "Select the PDF page whose preview adjustment you are editing."
+        )
+        self.lbl_adjust_page.setVisible(False)
+        self.cb_adjust_page.setVisible(False)
 
         # Two-sided printing: one tick turns it on, two more ticks pick the flip edge
         self.ck_duplex = QCheckBox("Print on both sides of paper")
@@ -1886,10 +1943,21 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         row_pg.setSpacing(10)
         row_pg.addWidget(box("Pages to Print", f3), 1)
         row_pg.addWidget(box("Two-sided", v_duplex), 1)
+        adjust_row = QHBoxLayout()
+        adjust_row.setContentsMargins(0, 0, 0, 0)
+        adjust_row.setSpacing(8)
+        adjust_row.addWidget(QLabel("Apply zoom / move / rotation to:"))
+        adjust_row.addWidget(self.cb_adjust_scope, 1)
+        adjust_row.addWidget(self.lbl_adjust_page)
+        adjust_row.addWidget(self.cb_adjust_page)
+        adjust_row.addStretch(1)
+        adjust_box = QWidget()
+        adjust_box.setLayout(adjust_row)
         left = QVBoxLayout()
         left.setSpacing(10)
         left.addLayout(copies_row)
         left.addLayout(row_pg)
+        left.addWidget(adjust_box)
         left.addWidget(box("Page Sizing && Handling", v2))
         left.addStretch(1)
 
@@ -1987,6 +2055,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_scale.valueChanged.connect(self._custom_scale_changed)
         self.cb_persheet.currentIndexChanged.connect(self._persheet_mode_changed)
         self.sp_persheet.valueChanged.connect(self.update_preview)
+        self.cb_adjust_scope.currentIndexChanged.connect(self._adjust_scope_changed)
+        self.cb_adjust_page.currentIndexChanged.connect(self._adjust_page_changed)
         for r in (self.rb_all, self.rb_cur, self.rb_range):
             r.toggled.connect(self.update_preview)
         self.ed_range.textChanged.connect(self.update_preview)
@@ -2187,6 +2257,170 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 "grayscale": self.ck_grayscale.isChecked(),
                 "options_touched": self._printer_options_touched}
 
+    def _adjust_scope(self):
+        return self.cb_adjust_scope.currentData() or "all"
+
+    def _read_adjustment(self):
+        """Read the three preview controls that can be page-specific."""
+        return {
+            "scale_mode": self.cb_scale.currentData() or "fit",
+            "scale_percent": int(self.sp_scale.value()),
+            "offset_mm": (float(self.sp_ox.value()), float(self.sp_oy.value())),
+            "rotation": float(self.image_rotation) % 360,
+        }
+
+    @staticmethod
+    def _normalise_adjustment(value):
+        if not isinstance(value, dict):
+            return None
+        try:
+            offset = value.get("offset_mm", (0.0, 0.0))
+            if not isinstance(offset, (list, tuple)) or len(offset) != 2:
+                offset = (0.0, 0.0)
+            return {
+                "scale_mode": value.get("scale_mode", "fit"),
+                "scale_percent": int(value.get("scale_percent", 100)),
+                "offset_mm": (float(offset[0]), float(offset[1])),
+                "rotation": float(value.get("rotation", 0.0)) % 360,
+            }
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _print_adjustment(value):
+        value = value or {"scale_mode": "fit", "scale_percent": 100,
+                          "offset_mm": (0.0, 0.0), "rotation": 0.0}
+        ox, oy = value.get("offset_mm", (0.0, 0.0))
+        return {
+            "scale_mode": value.get("scale_mode", "fit"),
+            "scale_percent": value.get("scale_percent", 100),
+            "offset_pt": (float(ox) / 25.4 * 72, float(oy) / 25.4 * 72),
+            "rotation": float(value.get("rotation", 0.0)) % 360,
+        }
+
+    def _active_adjust_page(self):
+        value = self.cb_adjust_page.currentData()
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _save_current_page_adjustment(self):
+        if self._adjust_scope() != "page" or self._loading_page_adjustment:
+            return
+        pno = self._editing_page
+        if pno is None:
+            pno = self._active_adjust_page()
+        if pno is not None:
+            self._page_adjustments[int(pno)] = self._read_adjustment()
+
+    def _load_page_adjustment(self, pno):
+        if pno is None:
+            return
+        adjustment = (self._page_adjustments.get(int(pno))
+                      or self._page_adjustment_base
+                      or self._read_adjustment())
+        self._loading_page_adjustment = True
+        try:
+            idx = self.cb_scale.findData(adjustment.get("scale_mode", "fit"))
+            old = self.cb_scale.blockSignals(True)
+            if idx >= 0:
+                self.cb_scale.setCurrentIndex(idx)
+            self.cb_scale.blockSignals(old)
+            old = self.sp_scale.blockSignals(True)
+            self.sp_scale.setValue(int(adjustment.get("scale_percent", 100)))
+            self.sp_scale.blockSignals(old)
+            ox, oy = adjustment.get("offset_mm", (0.0, 0.0))
+            for widget, value in ((self.sp_ox, ox), (self.sp_oy, oy)):
+                old = widget.blockSignals(True)
+                widget.setValue(float(value))
+                widget.blockSignals(old)
+            self.image_rotation = float(adjustment.get("rotation", 0.0)) % 360
+            self._editing_page = int(pno)
+        finally:
+            self._loading_page_adjustment = False
+
+    def _refresh_adjust_page_items(self, preferred=None):
+        pages = self.pages() or []
+        old = self._active_adjust_page()
+        if preferred in pages:
+            target = preferred
+        elif old in pages:
+            target = old
+        elif self.cur_page in pages:
+            target = self.cur_page
+        else:
+            target = pages[0] if pages else None
+        self._refreshing_adjust_pages = True
+        try:
+            old_signals = self.cb_adjust_page.blockSignals(True)
+            self.cb_adjust_page.clear()
+            for pno in pages:
+                self.cb_adjust_page.addItem(f"Page {pno + 1}", pno)
+            if target is not None:
+                idx = self.cb_adjust_page.findData(target)
+                if idx >= 0:
+                    self.cb_adjust_page.setCurrentIndex(idx)
+            self.cb_adjust_page.blockSignals(old_signals)
+        finally:
+            self._refreshing_adjust_pages = False
+        return target, old
+
+    def _show_page_in_preview(self, pno):
+        if pno is None:
+            return
+        groups = self.groups()
+        for i, group in enumerate(groups):
+            if pno in group:
+                self.pv = i
+                return
+
+    def _preview_page_settings(self):
+        if self._adjust_scope() != "page":
+            return None
+        self._save_current_page_adjustment()
+        base = self._page_adjustment_base or self._read_adjustment()
+        return {
+            int(pno): self._print_adjustment(self._page_adjustments.get(int(pno), base))
+            for pno in (self.pages() or [])
+        }
+
+    def _adjust_scope_changed(self, *_):
+        if self._refreshing_adjust_pages:
+            return
+        scope = self._adjust_scope()
+        previous = self._last_adjust_scope
+        if scope == "page":
+            if previous != "page" and not self._restoring_preferences:
+                self._page_adjustment_base = self._read_adjustment()
+            self.lbl_adjust_page.setVisible(True)
+            self.cb_adjust_page.setVisible(True)
+            target, _ = self._refresh_adjust_page_items(
+                getattr(self, "_preferred_adjust_page", None))
+            self._preferred_adjust_page = None
+            if target is not None:
+                self._load_page_adjustment(target)
+                self._show_page_in_preview(target)
+        else:
+            if previous == "page":
+                self._save_current_page_adjustment()
+            self.lbl_adjust_page.setVisible(False)
+            self.cb_adjust_page.setVisible(False)
+        self._last_adjust_scope = scope
+        if not self._restoring_preferences:
+            self.update_preview()
+
+    def _adjust_page_changed(self, *_):
+        if self._refreshing_adjust_pages or self._loading_page_adjustment:
+            return
+        self._save_current_page_adjustment()
+        target = self._active_adjust_page()
+        if target is None:
+            return
+        self._load_page_adjustment(target)
+        self._show_page_in_preview(target)
+        self.update_preview()
+
     def pages(self):
         if self.rb_all.isChecked():
             return list(range(len(self.doc)))
@@ -2207,6 +2441,18 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
     def step(self, d):
         self.pv += d
+        if self._adjust_scope() == "page":
+            groups = self.groups()
+            if groups:
+                self.pv = max(0, min(self.pv, len(groups) - 1))
+                target = groups[self.pv][0]
+                self._save_current_page_adjustment()
+                old = self.cb_adjust_page.blockSignals(True)
+                idx = self.cb_adjust_page.findData(target)
+                if idx >= 0:
+                    self.cb_adjust_page.setCurrentIndex(idx)
+                self.cb_adjust_page.blockSignals(old)
+                self._load_page_adjustment(target)
         self.update_preview()
 
     def duplex_mode(self, first_landscape):
@@ -2226,6 +2472,22 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
     def _restore_preferences(self, preset=None):
         """Restore the last print-dialog choices held in memory by the main window."""
         prefs = self._initial_preferences
+        self._restoring_preferences = True
+        self._page_adjustments = {}
+        self._page_adjustment_base = None
+        self._preferred_adjust_page = None
+        if prefs:
+            raw_pages = prefs.get("page_adjustments") or {}
+            if isinstance(raw_pages, dict):
+                for raw_page, raw_value in raw_pages.items():
+                    try:
+                        pno = int(raw_page)
+                    except (TypeError, ValueError):
+                        continue
+                    adjustment = self._normalise_adjustment(raw_value)
+                    if adjustment is not None and 0 <= pno < len(self.doc):
+                        self._page_adjustments[pno] = adjustment
+            self._preferred_adjust_page = prefs.get("adjust_page")
         if prefs:
             self.sp_copies.setValue(prefs.get("copies", self.sp_copies.value()))
             self._select_data(self.cb_paper, prefs.get("paper"))
@@ -2273,9 +2535,19 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 self.rb_range.setChecked(True)
         self._persheet_mode_changed()
         self._paper_changed()
+        self._page_adjustment_base = (self._normalise_adjustment(prefs.get("page_adjustment_base"))
+                                      if prefs else None) or self._read_adjustment()
+        scope = prefs.get("adjust_scope", "all") if prefs else "all"
+        old = self.cb_adjust_scope.blockSignals(True)
+        self._select_data(self.cb_adjust_scope, scope)
+        self.cb_adjust_scope.blockSignals(old)
+        self._last_adjust_scope = self._adjust_scope()
+        self._restoring_preferences = False
+        self._adjust_scope_changed()
 
     def preferences(self):
         """Snapshot every user-facing print option for reuse until this app closes."""
+        self._save_current_page_adjustment()
         pages_mode = "range" if self.rb_range.isChecked() else ("current" if self.rb_cur.isChecked() else "all")
         return {
             "printer": self.cb_printer.currentText(),
@@ -2292,6 +2564,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             "duplex": self.duplex_value(),
             "offset_mm": (self.sp_ox.value(), self.sp_oy.value()),
             "image_rotation": self.image_rotation,
+            "adjust_scope": self._adjust_scope(),
+            "adjust_page": self._active_adjust_page(),
+            "page_adjustment_base": self._page_adjustment_base or self._read_adjustment(),
+            "page_adjustments": {int(pno): dict(value) for pno, value in self._page_adjustments.items()},
             "save_toner": self.ck_save_toner.isChecked(),
             "compress": self.ck_compress.isChecked(),
             "grayscale": self.ck_grayscale.isChecked(),
@@ -2308,6 +2584,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         rows, cols = _grid_for(per_sheet)
         ls0 = _sheet_landscape(self.cb_orient.currentData(), per_sheet, rows, cols, self.doc[pg[0]].rect)
         save_toner = self.ck_save_toner.isChecked()
+        page_adjustments = self._preview_page_settings()
         return {"printer": self.cb_printer.currentText(), "copies": self.sp_copies.value(),
                 "paper": self.cb_paper.currentData(), "paper_custom_mm": self.custom_mm(),
                 "driver": self.driver_request(),
@@ -2317,6 +2594,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 "orient": self.cb_orient.currentData(),
                 "scale_mode": self.cb_scale.currentData(), "scale_percent": self.sp_scale.value(),
                 "image_rotation": self.image_rotation,
+                "page_adjustments": page_adjustments,
                 "save_toner": save_toner, "grayscale": self.ck_grayscale.isChecked(),
                 "compress": self.ck_compress.isChecked(),
                 "per_sheet": per_sheet, "offset_mm": (self.ox_mm, self.oy_mm),
@@ -2572,6 +2850,13 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         p.restore()
 
     def update_preview(self, *_):
+        if not self._loading_page_adjustment and not self._restoring_preferences:
+            if self._adjust_scope() == "page":
+                self._save_current_page_adjustment()
+                target, old = self._refresh_adjust_page_items()
+                if target is not None and target != old:
+                    self._load_page_adjustment(target)
+                    self._show_page_in_preview(target)
         pg = self.pages()
         self.btn_print.setEnabled(bool(pg))
         bad = not pg
@@ -2614,12 +2899,24 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
 
         offset_pt = (self.ox_mm / 25.4 * 72, self.oy_mm / 25.4 * 72)
         rotation = self.image_rotation % 360
-        cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah,
-                             self.cb_scale.currentData(), self.sp_scale.value(), offset_pt, rotation)
+        page_settings = self._preview_page_settings()
         # effective scale relative to Fit (also right for "Actual size"), shown next to the preview
-        fit_cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah, "fit", 100, offset_pt, rotation)
+        fit_page_settings = None
+        if page_settings:
+            fit_page_settings = {
+                pno: {"scale_mode": "fit", "scale_percent": 100,
+                      "offset_pt": (0.0, 0.0), "rotation": cfg.get("rotation", rotation)}
+                for pno, cfg in page_settings.items()
+            }
+        cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah,
+                             self.cb_scale.currentData(), self.sp_scale.value(), offset_pt,
+                             rotation, page_settings)
+        fit_cells = layout_sheet(self.doc, sheet, rows, cols, aw, ah, "fit", 100,
+                                 (0.0, 0.0), rotation, fit_page_settings)
+        focus_page = self._active_adjust_page() if self._adjust_scope() == "page" else None
+        focus_idx = next((i for i, cell in enumerate(cells) if cell[0] == focus_page), 0)
         try:
-            self._eff_pct = cells[0][2][2] / fit_cells[0][2][2] * 100.0
+            self._eff_pct = cells[focus_idx][2][2] / fit_cells[focus_idx][2][2] * 100.0
         except (ZeroDivisionError, IndexError):
             self._eff_pct = 100.0
         self.lbl_zoom.setText(f"{round(self._eff_pct)}%")
@@ -2629,7 +2926,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         paper.fill(QColor("white"))
         pp = QPainter(paper)
         first_center = None
-        for pno, clip, target in cells:
+        first_center_rotation = rotation
+        for pno, clip, target, page_rotation in cells:
             cx, cy, cw, ch = clip
             tx, ty, dw, dh = target
             clip_rect = QRectF(base_x + cx * k, base_y + cy * k, cw * k, ch * k)
@@ -2639,7 +2937,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 pp.setPen(QColor("#cccccc"))
                 pp.drawRect(clip_rect.adjusted(0, 0, -1, -1))
             pr = self.doc[pno].rect
-            bw, _bh = rot_bbox(pr.width, pr.height, rotation)
+            bw, _bh = rot_bbox(pr.width, pr.height, page_rotation)
             s = dw / bw if bw else 1.0
             uw, uh = pr.width * s, pr.height * s                           # the page's own size on paper
             mscale = max(0.05, min(s * k, 2.5))                            # cap preview render cost
@@ -2647,11 +2945,12 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             if self.ck_grayscale.isChecked():
                 img = img.convertToFormat(QImage.Format.Format_Grayscale8).convertToFormat(QImage.Format.Format_RGB32)
             ccx, ccy = base_x + (tx + dw / 2) * k, base_y + (ty + dh / 2) * k
-            if first_center is None:
+            if first_center is None or (focus_page is not None and pno == focus_page):
                 first_center = (ccx, ccy, uw * k, uh * k)
+                first_center_rotation = page_rotation
             pp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             pp.translate(ccx, ccy)
-            pp.rotate(rotation)
+            pp.rotate(page_rotation)
             pp.drawImage(QRectF(-uw * k / 2, -uh * k / 2, uw * k, uh * k), img)
             pp.restore()
         pp.end()
@@ -2678,7 +2977,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
             fcx, fcy, fw_, fh_ = first_center
             self.lbl_pv.set_frame(ox + fcx + (self.lbl_pv.width() - pm.width()) / 2,
                                   oy + fcy + (self.lbl_pv.height() - pm.height()) / 2,
-                                  fw_, fh_, rotation)
+                                  fw_, fh_, first_center_rotation)
         else:
             self.lbl_pv.set_frame(None)
 
@@ -2686,6 +2985,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         info = f"Sheet {self.pv + 1} / {len(grp)}  •  page(s) {rng}\n{paper_label} {'landscape' if ls else 'portrait'}"
         if duplex != "none":
             info += f"\nsheet {self.pv // 2 + 1}, {'front' if self.pv % 2 == 0 else 'back'}"
+        if self._adjust_scope() == "page" and focus_page is not None:
+            info += f"\nadjusting page {focus_page + 1}"
         self.lbl_info.setText(info)
 
 
@@ -4406,8 +4707,8 @@ class DocTab(QWidget):
 
         self.del_btns = []
         self.thumbs = ThumbList()
-        self.thumbs.setIconSize(QSize(118, 160))
-        self.thumbs.setFixedWidth(172)
+        self.thumbs.setIconSize(QSize(108, 148))
+        self.thumbs.setFixedWidth(154)
         self.thumbs.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.thumbs.currentRowChanged.connect(self.goto_page)
         self.thumbs.layout_changed.connect(self.place_del_buttons)
@@ -6189,7 +6490,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
         self.zoom_lbl = QLabel()
         self.zoom_lbl.setObjectName("StatusPill")
         self.statusBar().addPermanentWidget(self.zoom_lbl)
-        self.statusBar().setMinimumHeight(38)
+        self.statusBar().setMinimumHeight(32)
         # page counter in the middle of the status bar: "Page [ 3 ] / 8"; type a number + Enter to jump there
         self.page_lbl = QWidget(self.statusBar())
         self.page_lbl.setObjectName("PageBar")
@@ -6201,7 +6502,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
         self.page_box = QLineEdit()
         self.page_box.setObjectName("PageBox")
         self.page_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.page_box.setFixedWidth(68)
+        self.page_box.setFixedWidth(52)
         self.page_box.setValidator(QIntValidator(1, 999999, self))
         self.page_box.setToolTip("Type a page number and press Enter to go to that page")
         self.page_box.returnPressed.connect(self.page_box_go)
@@ -6477,12 +6778,30 @@ class Main(DarkTitleBarMixin, QMainWindow):
             QTimer.singleShot(0, done)                      # the sender was already gone: handle what it wrote
 
     # ---------- UI ----------
-    def _act(self, text, slot, key=None, checkable=False):
+    def _act(self, text, slot, key=None, checkable=False, icon=None):
         a = QAction(text, self)
         a.triggered.connect(slot)
         if key:
             a.setShortcut(QKeySequence(key))
         a.setCheckable(checkable)
+        if icon is not None:
+            source = icon if isinstance(icon, QIcon) else self.style().standardIcon(icon)
+            if not isinstance(icon, QIcon):
+                # Qt's Windows standard icons are often yellow/blue. Flatten them to the
+                # current text colour so the toolbar stays quiet and visually consistent.
+                pm = source.pixmap(QSize(24, 24))
+                image = pm.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+                ink = QColor(T["TEXT"])
+                for y in range(image.height()):
+                    for x in range(image.width()):
+                        c = image.pixelColor(x, y)
+                        if c.alpha():
+                            lum = (0.299 * c.red()) + (0.587 * c.green()) + (0.114 * c.blue())
+                            shade = 0.48 + (0.52 * lum / 255.0)
+                            image.setPixelColor(x, y, QColor(int(ink.red() * shade), int(ink.green() * shade),
+                                                             int(ink.blue() * shade), c.alpha()))
+                source = QIcon(QPixmap.fromImage(image))
+            a.setIcon(source)
         return a
 
     def _tab_call(self, name, *args):
@@ -6496,27 +6815,50 @@ class Main(DarkTitleBarMixin, QMainWindow):
         m = self.menuBar()
         tb = QToolBar("main")
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        tb.setIconSize(QSize(18, 18))
+        tb.setToolTipDuration(2600)
         self.toolbar = tb                                    # placed under the tab strip (see __init__)
-        T = self._tab_call
-        self.a_edit = self._act("✎ Edit text", self.toggle_edit, "Ctrl+E", True)
+        call = self._tab_call
+        SP = QStyle.StandardPixmap
+
+        def stroke_icon(draw):
+            pm = QPixmap(64, 64)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            pen = QPen(QColor(T["TEXT"]), 4.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            draw(p)
+            p.end()
+            return QIcon(pm)
+
+        print_icon = stroke_icon(lambda p: (
+            p.drawRoundedRect(QRectF(10, 24, 44, 24), 5, 5),
+            p.drawRect(QRectF(19, 10, 26, 20)),
+            p.drawRect(QRectF(19, 40, 26, 14)),
+            p.drawLine(QPointF(24, 46), QPointF(40, 46))))
+        self.a_edit = self._act("Edit text", self.toggle_edit, "Ctrl+E", True, SP.SP_FileDialogDetailedView)
         # Close tab / Delete page(s) / Move up / Move down / Merge PDFs are no longer shown in the menus or the
         # toolbar (tabs have their x, thumbnails have the trash button and drag-to-reorder). The keyboard
         # shortcuts keep working through hidden window-level actions.
         for _a in (self._act("Close tab", self.close_tab, "Ctrl+W"),
-                   self._act("Delete page(s)", T("delete_pages"), "Delete"),
-                   self._act("Move up", T("move", -1), "Alt+Up"),
-                   self._act("Move down", T("move", 1), "Alt+Down")):
+                   self._act("Delete page(s)", call("delete_pages"), "Delete"),
+                   self._act("Move up", call("move", -1), "Alt+Up"),
+                   self._act("Move down", call("move", 1), "Alt+Down")):
             self.addAction(_a)
         acts = {
-            "File": [self._act("Open…", self.open_dialog, "Ctrl+O"),
-                     self._act("Save", T("save"), "Ctrl+S"),
-                     self._act("Save As…", T("save_as"), "Ctrl+Shift+S"),
-                     self._act("🖨 Print…", self.print_doc, "Ctrl+P")],
-            "Pages": [self._act("＋ Add blank page", T("add_blank"), "Ctrl+Shift+N"),
-                      self._act("⇪ Insert PDF…", T("insert_pdf"), "Ctrl+I"),
-                      self._act("⟳ Rotate", T("rotate"), "Ctrl+R")],
-            "Edit": [self._act("↶ Undo", T("undo"), "Ctrl+Z"), self.a_edit],
+            "File": [self._act("Open…", self.open_dialog, "Ctrl+O", icon=SP.SP_DialogOpenButton),
+                     self._act("Save", call("save"), "Ctrl+S", icon=SP.SP_DialogSaveButton),
+                     self._act("Save As…", call("save_as"), "Ctrl+Shift+S", icon=SP.SP_DialogSaveAllButton),
+                     self._act("Print…", self.print_doc, "Ctrl+P", icon=print_icon)],
+            "Pages": [self._act("Add blank page", call("add_blank"), "Ctrl+Shift+N", icon=SP.SP_FileDialogNewFolder),
+                      self._act("Insert PDF…", call("insert_pdf"), "Ctrl+I", icon=SP.SP_FileIcon),
+                      self._act("Rotate", call("rotate"), "Ctrl+R", icon=SP.SP_BrowserReload)],
+            "Edit": [self._act("Undo", call("undo"), "Ctrl+Z", icon=SP.SP_ArrowBack), self.a_edit],
             "View": [self._act("Zoom in", lambda: self._zoom(1.2), "Ctrl+="),
                      self._act("Zoom out", lambda: self._zoom(1 / 1.2), "Ctrl+-"),
                      self._act("Next tab", lambda: self.step_tab(1), "Ctrl+PgDown"),
@@ -6530,7 +6872,10 @@ class Main(DarkTitleBarMixin, QMainWindow):
             for a in lst:
                 menu.addAction(a)
         for title in ("File", "Pages", "Edit"):
-            for a in acts[title]:
+            toolbar_actions = acts[title]
+            if title == "File":
+                toolbar_actions = [acts[title][0], acts[title][1], acts[title][3]]
+            for a in toolbar_actions:
                 tb.addAction(a)
             tb.addSeparator()
 

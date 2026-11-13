@@ -21,7 +21,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
       - name: Build
-        run: pyinstaller --noconfirm --onedir --windowed --noupx --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --hidden-import fontTools.subset --collect-submodules fontTools.ttLib --name PDFStudio --icon pdfstudio.ico pdf_studio.py
+        run: pyinstaller --noconfirm --onedir --windowed --noupx --runtime-hook pdfstudio_rthook.py --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --hidden-import fontTools.subset --collect-submodules fontTools.ttLib --name PDFStudio --icon pdfstudio.ico pdf_studio.py
+      - name: Keep Qt's ICU binding compatible with Windows
+        shell: pwsh
+        run: |
+          # PyMuPDF can contribute ICU 78 with suffixed exports. Qt 6.11 expects
+          # the Windows ICU ABI (ucnv_open), so let Windows resolve its system ICU.
+          Remove-Item -LiteralPath dist/PDFStudio/_internal/icuuc.dll -Force -ErrorAction SilentlyContinue
       - name: Zip
         shell: pwsh
         run: Compress-Archive -Path dist/PDFStudio -DestinationPath PDFStudio-windows.zip

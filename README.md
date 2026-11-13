@@ -36,7 +36,9 @@ To build locally:
 
 ```
 pip install -r requirements.txt pyinstaller
-pyinstaller --noconfirm --onefile --windowed --noupx --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --name PDFStudio pdf_studio.py
+pyinstaller --noconfirm --onedir --windowed --noupx --runtime-hook pdfstudio_rthook.py --exclude-module pymupdf4llm --exclude-module pymupdf.layout --exclude-module pymupdf_layout --exclude-module onnxruntime --exclude-module numpy --exclude-module networkx --exclude-module yaml --exclude-module psutil --exclude-module tabulate --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --name PDFStudio --icon pdfstudio.ico pdf_studio.py
+# Qt 6.11 uses the Windows ICU ABI; remove PyMuPDF's incompatible ICU 78 copy.
+Remove-Item dist/PDFStudio/_internal/icuuc.dll -Force -ErrorAction SilentlyContinue
 ```
 
 ## Requirements
