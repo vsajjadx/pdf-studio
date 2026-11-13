@@ -1814,13 +1814,18 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.ed_range = QLineEdit()
         self.ed_range.setPlaceholderText("e.g. 1-3, 5, 8-")
 
-        self.cb_adjust_scope = QComboBox()
-        self.cb_adjust_scope.addItem("All printed pages", "all")
-        self.cb_adjust_scope.addItem("Each page individually", "page")
-        self.cb_adjust_scope.setToolTip(
-            "Choose whether zoom, move and rotation affect every printed page\n"
-            "or are remembered separately for each page."
+        self.rb_adjust_all = QRadioButton("All printed pages")
+        self.rb_adjust_page = QRadioButton("Each page separately")
+        self.rb_adjust_all.setChecked(True)
+        self.rb_adjust_all.setToolTip(
+            "Zoom, move and rotation affect every page in this print job."
         )
+        self.rb_adjust_page.setToolTip(
+            "Remember zoom, move and rotation independently for each PDF page."
+        )
+        self.grp_adjust_scope = QButtonGroup(self)
+        self.grp_adjust_scope.addButton(self.rb_adjust_all)
+        self.grp_adjust_scope.addButton(self.rb_adjust_page)
         self.lbl_adjust_page = QLabel("Page to adjust:")
         self.cb_adjust_page = QComboBox()
         self.cb_adjust_page.setMinimumWidth(118)
@@ -1947,7 +1952,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         adjust_row.setContentsMargins(0, 0, 0, 0)
         adjust_row.setSpacing(8)
         adjust_row.addWidget(QLabel("Apply zoom / move / rotation to:"))
-        adjust_row.addWidget(self.cb_adjust_scope, 1)
+        adjust_row.addWidget(self.rb_adjust_all)
+        adjust_row.addWidget(self.rb_adjust_page)
         adjust_row.addWidget(self.lbl_adjust_page)
         adjust_row.addWidget(self.cb_adjust_page)
         adjust_row.addStretch(1)
@@ -2055,7 +2061,8 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self.sp_scale.valueChanged.connect(self._custom_scale_changed)
         self.cb_persheet.currentIndexChanged.connect(self._persheet_mode_changed)
         self.sp_persheet.valueChanged.connect(self.update_preview)
-        self.cb_adjust_scope.currentIndexChanged.connect(self._adjust_scope_changed)
+        self.rb_adjust_all.toggled.connect(self._adjust_scope_changed)
+        self.rb_adjust_page.toggled.connect(self._adjust_scope_changed)
         self.cb_adjust_page.currentIndexChanged.connect(self._adjust_page_changed)
         for r in (self.rb_all, self.rb_cur, self.rb_range):
             r.toggled.connect(self.update_preview)
@@ -2258,7 +2265,7 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
                 "options_touched": self._printer_options_touched}
 
     def _adjust_scope(self):
-        return self.cb_adjust_scope.currentData() or "all"
+        return "page" if self.rb_adjust_page.isChecked() else "all"
 
     def _read_adjustment(self):
         """Read the three preview controls that can be page-specific."""
@@ -2538,9 +2545,10 @@ class PrintDialog(DarkTitleBarMixin, QDialog):
         self._page_adjustment_base = (self._normalise_adjustment(prefs.get("page_adjustment_base"))
                                       if prefs else None) or self._read_adjustment()
         scope = prefs.get("adjust_scope", "all") if prefs else "all"
-        old = self.cb_adjust_scope.blockSignals(True)
-        self._select_data(self.cb_adjust_scope, scope)
-        self.cb_adjust_scope.blockSignals(old)
+        old = self.rb_adjust_page.blockSignals(True)
+        self.rb_adjust_page.setChecked(scope == "page")
+        self.rb_adjust_page.blockSignals(old)
+        self.rb_adjust_all.setChecked(scope != "page")
         self._last_adjust_scope = self._adjust_scope()
         self._restoring_preferences = False
         self._adjust_scope_changed()
