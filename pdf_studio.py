@@ -44,6 +44,19 @@ os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
 sys.modules.setdefault("pymupdf.layout", None)
 sys.modules.setdefault("pymupdf4llm", None)         # markdown export helper (pulls in numpy); also unused
 
+# The PDF engine is intentionally loaded on demand. Qt can paint the main window while a cold Windows install
+# loads MuPDF's native DLLs; this keeps the first launch responsive after boot instead of blocking before a window
+# exists. All document-facing code calls `_ensure_fitz()` before using this module.
+fitz = None
+
+
+def _ensure_fitz():
+    global fitz
+    if fitz is None:
+        import importlib
+        fitz = importlib.import_module("pymupdf")
+    return fitz
+
 SERVER_NAME = "PDFStudio_single_instance_" + re.sub(r"\W", "_", os.environ.get("USERNAME", os.environ.get("USER", "u")))
 APP_USER_MODEL_ID = "PDFStudio.PDFStudio.1"     # Windows taskbar identity (own icon + own button group)
 
@@ -148,7 +161,7 @@ def merge_main(paths):
 def combine_to_doc(items):
     """Combine PDFs and images into ONE document held in memory. Nothing is written to disk: the result opens as an
     unsaved tab and becomes a file only when the user saves it. Returns (document, [skipped files])."""
-    import pymupdf as fitz
+    fitz = _ensure_fitz()
     out = fitz.open()
     skipped = []
     for p in items:
@@ -440,9 +453,8 @@ def uninstall_context_menu():
 # ============================================================================
 #  GUI
 # ============================================================================
-import pymupdf as fitz
 from PyQt6.QtCore import (Qt, QSize, QSizeF, QPoint, QPointF, QRectF, QMarginsF, QTimer, QEvent,
-                          QMimeData, QObject, QSettings, QUrl, pyqtSignal)
+                          QMimeData, QObject, QSettings, QUrl, QThread, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QCursor, QDrag, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
                          QPalette, QPixmap, QPainter, QPen, QPainterPath, QPageLayout, QPageSize, QRadialGradient,
                          QTextCursor, QTextBlockFormat, QTransform, QIntValidator)
@@ -465,6 +477,17 @@ PAPERS = {"A0": QPageSize.PageSizeId.A0, "A1": QPageSize.PageSizeId.A1, "A2": QP
 CUSTOM_PAPER = "custom"
 RENDER_DPI_DEFAULT = 300
 MAX_BAND_PIXELS = 25_000_000      # big sheets (A0, plotter rolls) are rendered in strips of at most this size
+
+
+class _FitzLoader(QThread):
+    """Import MuPDF off the GUI thread so a cold first open can paint the window immediately."""
+    ready = pyqtSignal(object, object)                     # (module, exception)
+
+    def run(self):
+        try:
+            self.ready.emit(_ensure_fitz(), None)
+        except Exception as e:
+            self.ready.emit(None, e)
 
 
 def page_size_for(paper, custom_mm=(210.0, 297.0)):
@@ -4905,6 +4928,7 @@ class DocTab(QWidget):
     # ---------- file ----------
     def load(self, p):
         try:
+            _ensure_fitz()
             d = None
             try:                                            # read into memory: Windows never keeps the file locked / undeletable
                 if os.path.getsize(p) <= 300 * 1024 * 1024:
@@ -4928,6 +4952,7 @@ class DocTab(QWidget):
 
     def load_doc(self, d, title, suggest):
         """Show a document that only exists in memory. It is dirty, so closing asks first, and Save asks for a file."""
+        _ensure_fitz()
         self.doc, self.path, self.cur, self.undo_stack, self.dirty = d, None, 0, [], True
         self.title, self.suggest = title, suggest
         self._center_h = True
@@ -6593,6 +6618,8 @@ class Main(DarkTitleBarMixin, QMainWindow):
         self.setObjectName("AppWindow")
         self.setWindowIcon(app_icon())
         self.server = None
+        self._fitz_loader = None
+        self._pending_open_paths = None
         self._print_dialog_preferences = None    # session-only; cleared when this app process exits
         self._settings = QSettings("PDFStudio", "PDFStudio")     # remembers window size/position between runs
         self.resize(1200, 850)
@@ -6666,9 +6693,46 @@ class Main(DarkTitleBarMixin, QMainWindow):
         except OSError:
             return False
 
+    def open_paths_deferred(self, paths):
+        """Load the native PDF engine in the background, then open queued paths on the GUI thread.
+
+        Importing PyMuPDF pulls a 25 MB native MuPDF DLL and is noticeably slower on a cold Windows boot. Keeping
+        that work off the event loop lets Qt paint the window and keeps Explorer launches visibly responsive.
+        """
+        if fitz is not None:
+            self.open_paths(paths)
+            return
+        if self._pending_open_paths is None:
+            self._pending_open_paths = []
+        self._pending_open_paths.append(list(paths))
+        self.statusBar().showMessage("Preparing PDF engine…" if paths and paths[0] == MERGE_TAG else "Opening PDF…")
+        if self._fitz_loader is not None:
+            return
+        loader = _FitzLoader(self)
+        self._fitz_loader = loader
+        loader.ready.connect(self._on_fitz_ready)
+        loader.finished.connect(loader.deleteLater)
+        loader.start()
+
+    def _on_fitz_ready(self, module, error):
+        global fitz
+        self._fitz_loader = None
+        if error is not None or module is None:
+            self._pending_open_paths = None
+            QMessageBox.warning(self, "PDF Studio", f"Could not start the PDF engine:\n{error}")
+            return
+        fitz = module
+        batches = self._pending_open_paths or []
+        self._pending_open_paths = None
+        for batch in batches:
+            self.open_paths(batch)
+
     def open_paths(self, paths):
         """Open every PDF in `paths`. A path that cannot be opened is reported with its exact text instead of
         being skipped silently, so a failing 'Open with' shows what Windows actually handed over."""
+        if fitz is None:
+            self.open_paths_deferred(paths)
+            return
         if paths and paths[0] == MERGE_TAG:
             self.open_combined(paths[1:])
             return
@@ -6902,7 +6966,7 @@ class Main(DarkTitleBarMixin, QMainWindow):
             if paths == ["::noop::"]:
                 sock.deleteLater()
                 return
-            self.open_paths(paths)
+            self.open_paths_deferred(paths)
             self.bring_to_front()
             sock.deleteLater()
         sock.disconnected.connect(done)
@@ -7238,7 +7302,9 @@ if __name__ == "__main__":
         app.setQuitOnLastWindowClosed(True)
     if not background or paths:
         w.show()
-    w.open_paths(paths)
+    if paths:
+        # Let Qt paint the shell before importing MuPDF's native engine on a cold Windows boot.
+        QTimer.singleShot(60, lambda p=paths: w.open_paths_deferred(p))
     import threading
     QTimer.singleShot(4000, lambda: threading.Thread(target=_cleanup_old_page_exports, daemon=True).start())
     QTimer.singleShot(2500, refresh_registration_if_stale)  # fix a dead exe path in the Explorer registration
