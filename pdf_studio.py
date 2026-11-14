@@ -4833,7 +4833,10 @@ class DocTab(QWidget):
         self._nav, self._pending, self._frac, self._screen_off = False, False, None, None
         self._center_h = False                              # centre the page horizontally after (re)loading
 
-        self.del_btns = []
+        # Create a delete button only for the thumbnail currently under the mouse.
+        # A large PDF can have thousands of pages; one hidden QWidget per page makes
+        # the first open unnecessarily expensive.
+        self.del_btns = {}
         self.thumbs = ThumbList()
         self.thumbs.setIconSize(QSize(108, 148))
         self.thumbs.setFixedWidth(154)
@@ -5025,7 +5028,9 @@ class DocTab(QWidget):
         self.thumbs.blockSignals(True)
         self.thumbs.clear()
         n_pages = len(self.doc)
-        near = set(range(max(0, keep - 6), min(n_pages, keep + 7))) if n_pages > 24 else set(range(n_pages))
+        # Keep the first paint cheap even for small/medium PDFs. The remaining
+        # thumbnails are filled by _thumb_tick without blocking the first window.
+        near = set(range(max(0, keep - 2), min(n_pages, keep + 3)))
         for i in range(n_pages):                              # big files: only the pages around the current one now, the rest in the background
             item = QListWidgetItem(self.thumb_icon(i) if i in near else self._thumb_placeholder(i), str(i + 1))
             item.setSizeHint(QSize(140, THUMB_STRIP))         # stacked pages: each page owns only its top strip
@@ -5046,14 +5051,10 @@ class DocTab(QWidget):
         self.thumbs.show_selection(False)
         self.thumbs._prog.clear()
         self.thumbs.set_pinned(self.cur)
-        for b in self.del_btns:
+        for b in self.del_btns.values():
             b.hide()
             b.deleteLater()
-        self.del_btns = []
-        for i in range(len(self.doc)):
-            btn = DelButton(i, self.thumbs.viewport())
-            btn.clicked.connect(lambda _=False, b=btn: self.delete_page_at(b.index))
-            self.del_btns.append(btn)
+        self.del_btns = {}
         self.place_del_buttons()
         QTimer.singleShot(0, self.place_del_buttons)
         self.build_pages(screen_off=screen_off)
@@ -5105,22 +5106,25 @@ class DocTab(QWidget):
         """Each trash button sits in the top-left corner of its page thumbnail (only the page under the mouse shows one)."""
         vp = self.thumbs.viewport()
         hov = self.thumbs._hover
-        for i, b in enumerate(self.del_btns):
-            if i != hov:
-                if b.isVisible():
-                    b.hide()
-                continue
-            r = self.thumbs.thumb_rect(i) if self.thumbs.item(i) is not None else None
-            if r is None or r.top() + 30 < 0 or r.top() > vp.height():
+        for b in self.del_btns.values():
+            if b.isVisible():
                 b.hide()
-                continue
-            spot = QRectF(r.left() + 4, r.top() + 4, 24, 24)   # inside the thumbnail, top-left corner
-            if self.thumbs.covered_by_reveal(i, spot):         # another page is sliding open over this corner
-                b.hide()
-                continue
-            b.move(int(spot.left()), int(spot.top()))
-            b.show()
-            b.raise_()
+        if hov is None or not (0 <= hov < len(self.doc)):
+            return
+        b = self.del_btns.get(hov)
+        if b is None:
+            b = DelButton(hov, self.thumbs.viewport())
+            b.clicked.connect(lambda _=False, button=b: self.delete_page_at(button.index))
+            self.del_btns[hov] = b
+        r = self.thumbs.thumb_rect(hov) if self.thumbs.item(hov) is not None else None
+        if r is None or r.top() + 30 < 0 or r.top() > vp.height():
+            return
+        spot = QRectF(r.left() + 4, r.top() + 4, 24, 24)   # inside the thumbnail, top-left corner
+        if self.thumbs.covered_by_reveal(hov, spot):         # another page is sliding open over this corner
+            return
+        b.move(int(spot.left()), int(spot.top()))
+        b.show()
+        b.raise_()
 
     def _after_build(self):
         if not self.doc or not self.ys or not self.isVisible():
